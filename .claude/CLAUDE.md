@@ -42,9 +42,10 @@ docker exec gofundbot bash /app/entrypoint.sh
 - **新增依赖**：`docker exec gofundbot pip3 install --break-system-packages xxx`
 - **重启服务**：`docker restart gofundbot && sleep 8 && docker exec gofundbot bash /app/entrypoint.sh`
 - **看日志**：`docker exec gofundbot tail -f /var/log/supervisor/backend-stderr.log`
-- **容器内 git**：`docker exec gofundbot bash -c "cd /app && git pull"`
 - **容器内 commit & push**：`docker exec gofundbot bash -c "cd /app && git add -A && git commit -m 'xxx' && git push origin master"`
-- **Git 配置**：remote 已改为 SSH `git@github.com:zzzzes/GoFundBot.git`，用户 `Zes007`
+- **容器内 git pull**：`docker exec gofundbot bash -c "cd /app && git pull"`
+- **Git 配置**：remote=SSH `git@github.com:zzzzes/GoFundBot.git`, user=Zes007, email=zesqaq@gmail.com
+- **注意**：`.claude/CLAUDE.md` 被 .gitignore 忽略，需要用 `git add -f` 才能提交
 
 ## 重新安装依赖
 
