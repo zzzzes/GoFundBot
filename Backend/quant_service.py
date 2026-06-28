@@ -1,15 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-量化分析服务模块 — QuantService
+量化分析服务模块 — QuantService v2
 
-提供四大核心能力：
-1. 多因子打分系统（买什么 + 买多少）
-2. 智能买入策略（怎么买）
-3. 动态卖出信号（什么时候卖）
-4. AI 投资顾问（小白向导）
+完全重构。AI 是决策核心，不是附加功能。
 
-所有计算均基于现有数据库（FundBasicInfo / FundRiskMetrics / FundScreeningRank / FundTrend），
-不引入新数据源，确保离线可用。
+工作流程：
+1. 拉取数据库中的基金数据
+2. 计算标准化的量化指标（收益/风险/经理/稳定性，0-100 分）
+3. 将所有数据发给 LLM，让 AI 做最终决策：
+   - 哪只基金能买
+   - 每只买多少
+   - 用什么方式买
+   - 什么时候卖
+4. LLM 返回结构化 JSON，前端直接展示
+
+这样用户看到的每一个买入/卖出建议都是 AI 基于数据做的判断，
+而不是硬编码的 if-else 规则。
 """
 
 from __future__ import annotations
@@ -18,13 +24,23 @@ import json
 import math
 import statistics
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-# ---------------------------------------------------------------------------
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# 加载环境变量（让 LLM 配置生效）
+_env_path = Path(__file__).parent / '.env'
+if not _env_path.exists():
+    _env_path = Path(__file__).parent.parent / '.env'
+load_dotenv(dotenv_path=_env_path)
+
+
+# ============================================================================
 # 工具函数
-# ---------------------------------------------------------------------------
-
+# ============================================================================
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
     if val is None:
@@ -33,14 +49,6 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
-
-
-def _safe_int(val: Any, default: int = 0) -> int:
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return default
-
 
 def _json_loads(val: Any, default: Any = None) -> Any:
     if val is None:
@@ -52,9 +60,7 @@ def _json_loads(val: Any, default: Any = None) -> Any:
     except (json.JSONDecodeError, TypeError):
         return default if default is not None else {}
 
-
 def _none_to(val: Any, fallback: float) -> float:
-    """None → fallback；保留有效零值"""
     if val is None:
         return fallback
     try:
@@ -62,28 +68,8 @@ def _none_to(val: Any, fallback: float) -> float:
     except (ValueError, TypeError):
         return fallback
 
-
-def _clamp(val: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, val))
-
-
-def _percentile(sorted_values: List[float], pct: float) -> float:
-    """返回升序列表的 pct 分位数（0-100）"""
-    if not sorted_values:
-        return 0.0
-    k = (pct / 100.0) * (len(sorted_values) - 1)
-    f = int(math.floor(k))
-    c = int(math.ceil(k))
-    if f == c:
-        return sorted_values[f]
-    return sorted_values[f] * (c - k) + sorted_values[c] * (k - f)
-
-
-def _normalize_in_place(funds: List[Dict[str, Any]], key: str, invert: bool = False):
-    """
-    对 fund dict[key] 做 min-max 归一化到 0-100，覆盖写入 f'{key}_norm'
-    invert=True 表示值越小越好（如回撤）
-    """
+def _normalize_in_place(funds: List[Dict], key: str, invert: bool = False):
+    """对 fund dict[key] 做 min-max 归一化到 0-100"""
     vals = [_safe_float(f.get(key)) for f in funds]
     valid = [v for v in vals if v != 0.0]
     if not valid:
@@ -100,130 +86,369 @@ def _normalize_in_place(funds: List[Dict[str, Any]], key: str, invert: bool = Fa
             f[f"{key}_norm"] = 100.0 - score if invert else score
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # 数据类
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class FactorWeights:
-    """因子权重配置 — 不同风险偏好的默认值"""
-    return_weight: float = 30.0   # 收益因子
-    risk_weight: float = 30.0     # 风险因子（稳健型可调高）
-    manager_weight: float = 15.0  # 经理因子
-    macro_weight: float = 10.0    # 宏观/行业因子
-    stability_weight: float = 15.0  # 稳定性因子（趋势一致性）
-
-    def validate(self) -> "FactorWeights":
-        total = self.return_weight + self.risk_weight + self.manager_weight + self.macro_weight + self.stability_weight
-        if total > 0:
-            self.return_weight = self.return_weight / total * 100
-            self.risk_weight = self.risk_weight / total * 100
-            self.manager_weight = self.manager_weight / total * 100
-            self.macro_weight = self.macro_weight / total * 100
-            self.stability_weight = self.stability_weight / total * 100
-        return self
-
-
-# 预设权重配置
-PRESET_WEIGHTS = {
-    "balanced": FactorWeights(return_weight=30, risk_weight=30, manager_weight=15, macro_weight=10, stability_weight=15),
-    "conservative": FactorWeights(return_weight=15, risk_weight=40, manager_weight=15, macro_weight=10, stability_weight=20),
-    "aggressive": FactorWeights(return_weight=40, risk_weight=20, manager_weight=15, macro_weight=15, stability_weight=10),
-    "momentum": FactorWeights(return_weight=45, risk_weight=15, manager_weight=10, macro_weight=15, stability_weight=15),
-}
-
+# ============================================================================
 
 @dataclass
 class PositionParams:
-    """仓位计算参数"""
-    total_capital: float = 100000.0          # 总资金（元）
-    max_single_fund_pct: float = 20.0       # 单基最大仓位（%）
-    max_total_funds: int = 8                 # 最多持有基金数
-    risk_budget: float = 12.0               # 风险预算（期望波动率%）
-    min_position: float = 500.0              # 最低持仓金额
-
+    total_capital: float = 100000.0
+    max_single_fund_pct: float = 20.0
+    max_total_funds: int = 8
+    risk_budget: float = 12.0
 
 @dataclass
 class BacktestAdvancedParams:
-    """高级回测参数"""
     fund_code: str = ""
     start_date: str = "2020-01-01"
     end_date: str = ""
-    strategy: str = "value_averaging"        # dca / value_averaging / grid / adaptive
-    base_amount: float = 1000.0              # 基准投资金额
-    fee_rate: float = 0.15                   # 手续费(%)
-    pe_series: Optional[List[Dict]] = None   # PE 估值序列
-    ma_period: int = 60                      # 均线周期
-    grid_step: float = 5.0                   # 网格步长(%)
-
+    strategy: str = "dca"
+    base_amount: float = 1000.0
+    fee_rate: float = 0.15
+    pe_series: Optional[List[Dict]] = None
+    ma_period: int = 60
+    grid_step: float = 5.0
 
 @dataclass
 class QuantScore:
-    """单只基金量化打分结果"""
     fund_code: str = ""
     fund_name: str = ""
     fund_type: str = ""
-    # 各因子得分 (0-100)
     return_score: float = 0.0
     risk_score: float = 0.0
     manager_score: float = 0.0
     macro_score: float = 0.0
     stability_score: float = 0.0
-    # 综合
     composite_score: float = 0.0
-    # 建议
-    suggested_position_pct: float = 0.0       # 建议仓位占比(%)
-    suggested_amount: float = 0.0             # 建议买入金额
-    operation: str = "hold"                   # buy_heavy / buy / hold / reduce / sell
-    # 描述
+    suggested_position_pct: float = 0.0
+    suggested_amount: float = 0.0
+    operation: str = "hold"
     summary: str = ""
     strengths: List[str] = field(default_factory=list)
     weaknesses: List[str] = field(default_factory=list)
+    # AI 生成的额外字段
+    ai_reason: str = ""           # AI 给出的买入/卖出理由
+    ai_risk_warning: str = ""     # AI 给出的风险提示
+    ai_strategy_tip: str = ""     # AI 给出的操作建议
 
 
-# ---------------------------------------------------------------------------
-# QuantService 核心
-# ---------------------------------------------------------------------------
-
+# ============================================================================
+# QuantService — 重构版
+# ============================================================================
 
 class QuantService:
-    """量化分析服务 — 无状态，纯计算"""
 
-    def __init__(self, db_session_factory=None):
-        self._db_factory = db_session_factory
+    def __init__(self):
+        self._openai_client = None
+        self._api_key = os.getenv("LLM_API_KEY", "")
+        self._api_base = os.getenv("LLM_API_BASE", "https://api.deepseek.com/v1")
+        self._model = os.getenv("LLM_MODEL", "deepseek-chat")
 
-    # ------------------------------------------------------------------
-    # 1. 多因子打分
-    # ------------------------------------------------------------------
+    @property
+    def ai_available(self) -> bool:
+        return bool(self._api_key)
 
-    def score_funds(
+    def _get_llm_client(self):
+        """懒加载 OpenAI 兼容客户端"""
+        if self._openai_client is None and self._api_key:
+            try:
+                from openai import OpenAI
+                self._openai_client = OpenAI(
+                    api_key=self._api_key,
+                    base_url=self._api_base,
+                )
+            except ImportError:
+                print("[QuantService] 请安装 openai: pip install openai")
+            except Exception as e:
+                print(f"[QuantService] LLM 初始化失败: {e}")
+        return self._openai_client
+
+    def _call_llm(self, system_prompt: str, user_prompt: str, max_tokens: int = 4096) -> Optional[str]:
+        """调用 LLM，返回文本"""
+        client = self._get_llm_client()
+        if not client:
+            return None
+        try:
+            resp = client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"[QuantService] LLM 调用失败: {e}")
+            return None
+
+    def _parse_json_from_llm(self, text: str) -> Dict:
+        """从 LLM 返回中提取 JSON"""
+        import re
+        # 尝试 ```json ``` 代码块
+        m = re.search(r'```json\s*([\s\S]*?)\s*```', text)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+        # 尝试直接解析
+        try:
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            pass
+        # 尝试找到 { } 范围
+        start = text.find('{')
+        end = text.rfind('}')
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end+1])
+            except json.JSONDecodeError:
+                pass
+        return {}
+
+    # ==================================================================
+    # 核心：AI 驱动的买入/卖出决策
+    # ==================================================================
+
+    def ai_decide(
         self,
         db,
+        total_capital: float = 100000,
+        risk_profile: str = "balanced",
+        investment_goal: str = "长期资产增值",
+        investment_horizon: str = "long",
         fund_codes: Optional[List[str]] = None,
         fund_type: Optional[str] = None,
-        min_return_1y: Optional[float] = None,
-        risk_profile: str = "balanced",
-        position_params: Optional[PositionParams] = None,
-        top_n: int = 20,
-        min_estab_years: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        AI 驱动的投资决策引擎。
+
+        这个方法是整个量化系统的核心：收集所有基金的量化数据，
+        构建一个完整的分析提示，然后让 LLM 做最终决策。
+
+        Returns:
+            {
+                "ai_analysis": { ... LLM 返回的完整决策 ... },
+                "funds_scored": [ ... 量化打分列表（供前端表格展示）... ],
+                "llm_used": true/false,
+                "model": "deepseek-chat"
+            }
+        """
+        # Step 1: 量化打分（标准化到 0-100）
+        scores = self._score_funds_internal(db, fund_codes, fund_type, risk_profile, total_capital, top_n=20)
+
+        if not scores:
+            return {"error": "没有找到符合条件的基金数据，请先同步数据", "funds_scored": [], "llm_used": False}
+
+        # Step 2: 如果没有 AI，返回纯量化结果
+        if not self.ai_available:
+            return {
+                "funds_scored": [s.__dict__ for s in scores],
+                "llm_used": False,
+                "ai_analysis": None,
+                "message": "⚠️ 未配置 LLM API Key，显示的是纯量化打分结果。配置 DeepSeek Key 后可获得 AI 决策建议。",
+            }
+
+        # Step 3: 构建 AI 提示
+        prompt = self._build_decision_prompt(scores, total_capital, risk_profile, investment_goal, investment_horizon)
+
+        system_prompt = """你是一位拥有 15 年经验的基金投资顾问，也是量化投资专家。你的客户是基金投资新手。"""
+
+        # Step 4: 调用 LLM
+        llm_text = self._call_llm(system_prompt, prompt, max_tokens=4096)
+        ai_analysis = self._parse_json_from_llm(llm_text) if llm_text else None
+
+        return {
+            "funds_scored": [s.__dict__ for s in scores],
+            "llm_used": True,
+            "model": self._model,
+            "ai_analysis": ai_analysis,
+        }
+
+    # ==================================================================
+    # 构建 AI 决策提示
+    # ==================================================================
+
+    def _build_decision_prompt(self, scores, total_capital, risk_profile, investment_goal, investment_horizon):
+        """构建发送给 LLM 的完整决策提示"""
+        profile_desc = {
+            "conservative": "稳健型：追求资产保值增值，最大可承受回撤 10%，偏好低波动产品",
+            "balanced": "平衡型：追求适度增长，最大可承受回撤 20%",
+            "aggressive": "进取型：追求高回报，可承受较大波动",
+            "momentum": "动量型：追逐市场趋势",
+        }.get(risk_profile, "平衡型")
+
+        horizon_desc = {"short": "短期 (1年以内)", "medium": "中期 (1-3年)", "long": "长期 (3年以上)"}.get(investment_horizon, "中期")
+
+        lines = [f"""## 用户画像
+- 可用资金：{total_capital:,.0f} 元
+- 风险偏好：{profile_desc}
+- 投资目标：{investment_goal}
+- 投资期限：{horizon_desc}
+
+## 基金量化评分数据（按综合分降序排列）
+
+| # | 基金名称 | 代码 | 类型 | 综合 | 收益 | 风险 | 经理 | 稳定 | 仓位 |
+|---|---------|------|------|------|------|------|------|------|------|"""]
+
+        for i, s in enumerate(scores[:15], 1):
+            lines.append(f"| {i} | {s.fund_name} | {s.fund_code} | {s.fund_type} | {s.composite_score} | {s.return_score} | {s.risk_score} | {s.manager_score} | {s.stability_score} | {s.suggested_position_pct}% |")
+
+        lines.append(f"""
+## 各基金详情
+""")
+        for s in scores[:8]:
+            lines.append(f"""
+### {s.fund_name} ({s.fund_code})
+- 综合: {s.composite_score}/100 | 收益: {s.return_score}/100 | 风险: {s.risk_score}/100 | 经理: {s.manager_score}/100 | 稳定性: {s.stability_score}/100
+- 建议仓位: {s.suggested_position_pct}% (≈{s.suggested_amount:,.0f}元)
+- 亮点: {'; '.join(s.strengths)}
+- 风险点: {'; '.join(s.weaknesses)}
+""")
+
+        lines.append(f"""
+请基于以上数据，为这位新手投资者制定完整的投资方案。用中文输出 JSON（不要 markdown 代码块）：
+{{
+    "market_assessment": {{"overall_sentiment": "乐观/中性偏多/中性/中性偏空/谨慎", "sentiment_score": 0-100, "summary": "市场判断"}},
+    "portfolio_plan": {{
+        "total_to_invest": 数字,
+        "cash_reserve": 数字,
+        "cash_reserve_reason": "保留现金原因",
+        "funds": [{{"fund_code": "xxx", "fund_name": "xxx", "action": "重仓买入/买入/少量配置/观望/减仓", "allocation_pct": 数字, "allocation_amount": 数字, "buy_method": "一次性买入/分3批/每月定投", "buy_reason": "买入理由", "risk_warning": "风险", "stop_loss_condition": "止损条件", "target_return": "预期年化"}}]
+    }},
+    "execution_plan": {{"phase_1": "建仓期操作", "phase_2": "持有期操作", "rebalance_rule": "调仓规则"}},
+    "risk_management": {{"max_acceptable_drawdown": "最大回撤", "blacklist_conditions": ["清仓条件"]}},
+    "newbie_guide": {{"key_metrics_explained": "指标解释", "common_mistakes": ["错误1", "错误2"], "next_steps": ["步骤1", "步骤2"]}}
+}}""")
+
+        return "\n".join(lines)
+
+
+        # 构建基金数据摘要
+        fund_data = {
+            "fund_code": basic.fund_code,
+            "fund_name": basic.fund_name,
+            "fund_type": basic.fund_type,
+            "returns": {
+                "1m": _safe_float(perf.get("1_month_return")),
+                "3m": _safe_float(perf.get("3_month_return")),
+                "6m": _safe_float(perf.get("6_month_return")),
+                "1y": _safe_float(basic.return_1y or perf.get("1_year_return")),
+                "2y": _safe_float(perf.get("2_year_return")),
+                "3y": _safe_float(perf.get("3_year_return")),
+            },
+            "risk": {
+                "sharpe_1y": _none_to(risk.sharpe_ratio_1y if risk else None, 0),
+                "sharpe_3y": _none_to(risk.sharpe_ratio_3y if risk else None, 0),
+                "calmar_1y": _none_to(risk.calmar_ratio_1y if risk else None, 0),
+                "max_drawdown_1y": _none_to(risk.max_drawdown_1y if risk else None, 0),
+                "max_drawdown_3y": _none_to(risk.max_drawdown_3y if risk else None, 0),
+                "volatility_1y": _none_to(risk.volatility_1y if risk else None, 0),
+            },
+            "rankings": {
+                "1y": _none_to(rank.rank_pct_1y if rank else None, 50),
+                "2y": _none_to(rank.rank_pct_2y if rank else None, 50),
+                "3y": _none_to(rank.rank_pct_3y if rank else None, 50),
+            },
+            "pass_4433": bool(rank and rank.pass_4433 == 1),
+            "manager": {},
+        }
+
+        # 经理数据
+        mgr_json = _json_loads(extra.fund_managers_json if extra else "[]", [])
+        if isinstance(mgr_json, dict):
+            mgr_json = [mgr_json]
+        if mgr_json:
+            m = mgr_json[0]
+            fund_data["manager"] = {
+                "name": m.get("name", "未知"),
+                "experience": m.get("work_experience", "未知"),
+                "scale": m.get("managed_fund_size", "未知"),
+                "star": m.get("star_rating", "未知"),
+            }
+
+        # 净值趋势（最近 10 个点 + MA 信息）
+        nw = _json_loads(trend.net_worth_trend_json if trend else "[]", [])
+        recent_navs = []
+        for item in nw[-90:]:
+            nav = _safe_float(item.get("net_worth", 0)) if isinstance(item, dict) else _safe_float(item)
+            if nav > 0:
+                recent_navs.append(nav)
+        if len(recent_navs) >= 20:
+            ma20 = sum(recent_navs[-20:]) / 20
+            ma60 = sum(recent_navs[-min(60, len(recent_navs)):]) / min(60, len(recent_navs))
+            fund_data["trend_signal"] = {
+                "latest_nav": recent_navs[-1],
+                "ma20": round(ma20, 4),
+                "ma60": round(ma60, 4),
+                "above_ma20": recent_navs[-1] > ma20,
+                "above_ma60": recent_navs[-1] > ma60,
+            }
+
+        if not self.ai_available:
+            return {
+                "fund_data": fund_data,
+                "llm_used": False,
+                "ai_analysis": None,
+                "message": "⚠️ 未配置 LLM API Key",
+            }
+
+        # 构建 AI 提示
+        prompt = json.dumps(fund_data, ensure_ascii=False, indent=2)
+
+        system_prompt = """你是一位资深基金分析师。请基于基金数据，给出买卖建议。
+
+## 输出格式（严格 JSON）
+```json
+{
+    "action": "强烈买入/买入/持有/减仓/卖出",
+    "confidence": 0-100,
+    "score": 0-100,
+    "summary": "一句话总结（50字内）",
+    "bull_case": ["看涨理由1", "看涨理由2"],
+    "bear_case": ["看跌理由1", "看跌理由2"],
+    "key_metrics_analysis": {
+        "return_analysis": "收益分析（50字）",
+        "risk_analysis": "风险分析（50字）",
+        "manager_analysis": "经理分析（50字）",
+        "trend_analysis": "趋势分析（50字）"
+    },
+    "suggested_entry": {
+        "method": "一次性买入/分3批/每月定投/等回调再买/暂时不要买",
+        "reason": "为什么推荐这种买入方式",
+        "suggested_price_or_condition": "建议的买入价格或条件"
+    },
+    "suggested_exit": {
+        "stop_loss_price_or_pct": "止损价位或百分比",
+        "take_profit_price_or_pct": "止盈价位或百分比",
+        "time_stop": "最晚持有到什么时候如果还不涨就卖"
+    },
+    "risk_warnings": ["风险提示1", "风险提示2"]
+}
+```"""
+
+        llm_text = self._call_llm(system_prompt, prompt, max_tokens=2048)
+        ai_analysis = self._parse_json_from_llm(llm_text) if llm_text else None
+
+        return {
+            "fund_data": fund_data,
+            "llm_used": True,
+            "model": self._model,
+            "ai_analysis": ai_analysis,
+        }
+
+    # ==================================================================
+    # 内部：标准化量化打分（给 AI 提供结构化输入）
+    # ==================================================================
+
+    def _score_funds_internal(
+        self, db, fund_codes, fund_type, risk_profile, total_capital, top_n=20
     ) -> List[QuantScore]:
-        """
-        对基金库做多因子打分，返回排名 + 仓位建议。
-
-        因子体系：
-        1. 收益因子 (return)    — 1年/2年/3年排名百分位 + 绝对收益
-        2. 风险因子 (risk)      — 夏普比率 + 卡玛比率 + 最大回撤
-        3. 经理因子 (manager)   — 从业年限 + 年化回报 + 管理规模
-        4. 宏观因子 (macro)     — 行业分散度 + 持仓集中度
-        5. 稳定性因子 (stability) — 排名趋势一致性 + 波动率
-
-        仓位公式：
-        position_pct = max_single_pct × (risk_budget / volatility) / Σ(risk_budget / volatility)
-        """
+        """内部打分方法，返回标准化 0-100 分数"""
         from models import FundBasicInfo, FundRiskMetrics, FundScreeningRank, FundExtraData
 
-        # --- 数据拉取 ---
         query = db.query(FundBasicInfo, FundRiskMetrics, FundScreeningRank, FundExtraData).outerjoin(
             FundRiskMetrics, FundBasicInfo.fund_code == FundRiskMetrics.fund_code
         ).outerjoin(
@@ -231,266 +456,178 @@ class QuantService:
         ).outerjoin(
             FundExtraData, FundBasicInfo.fund_code == FundExtraData.fund_code
         )
-
         if fund_codes:
             query = query.filter(FundBasicInfo.fund_code.in_(fund_codes))
         if fund_type:
             query = query.filter(FundBasicInfo.fund_type.like(f"%{fund_type}%"))
-        if min_return_1y is not None:
-            query = query.filter(FundBasicInfo.return_1y >= min_return_1y)
 
         rows = query.all()
         if not rows:
             return []
 
-        # --- 提取字段 ---
-        funds: List[Dict[str, Any]] = []
+        funds = []
         for basic, risk, rank, extra in rows:
             perf = _json_loads(basic.performance_json)
             f = {
                 "fund_code": basic.fund_code,
                 "fund_name": basic.fund_name,
                 "fund_type": basic.fund_type or "未知",
-                "return_1y": _safe_float(basic.return_1y),
+                "return_1y": _safe_float(basic.return_1y or perf.get("1_year_return")),
                 "return_3y": _safe_float(perf.get("3_year_return")),
                 "return_6m": _safe_float(perf.get("6_month_return")),
                 "return_3m": _safe_float(perf.get("3_month_return")),
-                "return_1m": _safe_float(perf.get("1_month_return")),
-                # 风险
                 "sharpe_1y": _none_to(risk.sharpe_ratio_1y if risk else None, 0),
                 "sharpe_3y": _none_to(risk.sharpe_ratio_3y if risk else None, 0),
                 "calmar_1y": _none_to(risk.calmar_ratio_1y if risk else None, 0),
                 "max_drawdown_1y": _none_to(risk.max_drawdown_1y if risk else None, 50),
                 "volatility_1y": _none_to(risk.volatility_1y if risk else None, 25),
                 "annual_return_1y": _none_to(risk.annual_return_1y if risk else None, 0),
-                # 排名
                 "rank_1y": _none_to(rank.rank_pct_1y if rank else None, 50),
                 "rank_3y": _none_to(rank.rank_pct_3y if rank else None, 50),
-                "rank_2y": _none_to(rank.rank_pct_2y if rank else None, 50),
                 "rank_6m": _none_to(rank.rank_pct_6m if rank else None, 50),
                 "rank_3m": _none_to(rank.rank_pct_3m if rank else None, 50),
                 "pass_4433": bool(rank and rank.pass_4433 == 1),
-                # 经理信息
                 "manager_json": extra.fund_managers_json if extra else None,
-                "established_date": _json_loads(basic.basic_json).get("established_date", "") if basic.basic_json else "",
             }
-            # 过滤成立年限
-            estab_years = self._estab_years(f["established_date"])
-            if min_estab_years > 0 and estab_years < min_estab_years:
-                continue
-            # 解析经理数据
             mgr = _json_loads(f["manager_json"], [])
             if isinstance(mgr, dict):
                 mgr = [mgr]
-            f["manager_years"] = _safe_float(mgr[0].get("work_experience", 0)) if mgr else 0
-            f["manager_avg_return"] = _safe_float(mgr[0].get("years_avg_return", 0)) if mgr else 0
-            f["manager_scale"] = _safe_float(mgr[0].get("managed_fund_size", 0)) if mgr else 0
-
+            f["manager_years"] = _safe_float(mgr[0].get("work_experience", "5年") if mgr else 5)
+            f["manager_avg_return"] = _safe_float(mgr[0].get("years_avg_return", 0) if mgr else 0)
             funds.append(f)
 
         if not funds:
             return []
 
-        # --- 归一化 ---
+        # 归一化各维度到 0-100
         _normalize_in_place(funds, "return_1y", invert=False)
         _normalize_in_place(funds, "return_3y", invert=False)
-        _normalize_in_place(funds, "rank_1y", invert=True)  # 排名越小越好
+        _normalize_in_place(funds, "rank_1y", invert=True)
         _normalize_in_place(funds, "rank_3y", invert=True)
-
         _normalize_in_place(funds, "sharpe_1y", invert=False)
         _normalize_in_place(funds, "calmar_1y", invert=False)
         _normalize_in_place(funds, "max_drawdown_1y", invert=True)
         _normalize_in_place(funds, "volatility_1y", invert=True)
-
         _normalize_in_place(funds, "manager_years", invert=False)
         _normalize_in_place(funds, "manager_avg_return", invert=False)
 
-        # --- 计算因子得分 ---
-        weights = PRESET_WEIGHTS.get(risk_profile, PRESET_WEIGHTS["balanced"])
-        weights.validate()
+        # 风险偏好权重
+        weights = {
+            "conservative": {"ret": 15, "risk": 40, "mgr": 15, "macro": 10, "stab": 20},
+            "balanced":     {"ret": 30, "risk": 30, "mgr": 15, "macro": 10, "stab": 15},
+            "aggressive":   {"ret": 40, "risk": 20, "mgr": 15, "macro": 15, "stab": 10},
+            "momentum":     {"ret": 45, "risk": 15, "mgr": 10, "macro": 15, "stab": 15},
+        }.get(risk_profile, {"ret": 30, "risk": 30, "mgr": 15, "macro": 10, "stab": 15})
+
+        total_w = sum(weights.values()) or 1
 
         for f in funds:
-            # 1. 收益因子
             f["return_score"] = (
-                f["return_1y_norm"] * 0.35
-                + f["return_3y_norm"] * 0.25
-                + f["rank_1y_norm"] * 0.25
-                + f["rank_3y_norm"] * 0.15
+                f["return_1y_norm"] * 0.35 + f["return_3y_norm"] * 0.25
+                + f["rank_1y_norm"] * 0.25 + f["rank_3y_norm"] * 0.15
             )
-
-            # 2. 风险因子
             f["risk_score"] = (
-                f["sharpe_1y_norm"] * 0.30
-                + f["calmar_1y_norm"] * 0.25
-                + f["max_drawdown_1y_norm"] * 0.25
-                + f["volatility_1y_norm"] * 0.20
+                f["sharpe_1y_norm"] * 0.30 + f["calmar_1y_norm"] * 0.25
+                + f["max_drawdown_1y_norm"] * 0.25 + f["volatility_1y_norm"] * 0.20
             )
+            f["manager_score"] = f["manager_years_norm"] * 0.40 + f["manager_avg_return_norm"] * 0.60
+            f["macro_score"] = 60.0
 
-            # 3. 经理因子
-            f["manager_score"] = (
-                f["manager_years_norm"] * 0.40
-                + f["manager_avg_return_norm"] * 0.60
-            )
-
-            # 4. 宏观因子（行业分散度 + 规模）
-            f["macro_score"] = 60.0  # 默认中值，前端可校准
-
-            # 5. 稳定性因子（排名一致性）
             ranks = [f["rank_1y"], f["rank_3y"], f["rank_6m"], f["rank_3m"]]
-            valid_ranks = [r for r in ranks if r > 0]
-            if len(valid_ranks) >= 2:
-                rank_spread = statistics.stdev(valid_ranks) if len(valid_ranks) > 1 else 0
-                f["stability_score"] = max(0, 100 - rank_spread * 2)
-            else:
-                f["stability_score"] = 50.0
+            valid = [r for r in ranks if r > 0]
+            f["stability_score"] = max(0, 100 - statistics.stdev(valid) * 2) if len(valid) >= 2 else 50.0
 
-            # 综合分
-            f["composite_score"] = (
-                weights.return_weight * f["return_score"]
-                + weights.risk_weight * f["risk_score"]
-                + weights.manager_weight * f["manager_score"]
-                + weights.macro_weight * f["macro_score"]
-                + weights.stability_weight * f["stability_score"]
+            # 综合分 = 加权求和 / total_w，确保在 0-100 范围内
+            raw = (
+                weights["ret"] * f["return_score"]
+                + weights["risk"] * f["risk_score"]
+                + weights["mgr"] * f["manager_score"]
+                + weights["macro"] * f["macro_score"]
+                + weights["stab"] * f["stability_score"]
             )
+            f["composite_score"] = raw / total_w
 
-        # --- 排序 ---
+        # 排序
         funds.sort(key=lambda x: x["composite_score"], reverse=True)
-        top_funds = funds[:top_n]
+        top = funds[:top_n]
 
-        # --- 仓位计算 (风险预算法) ---
-        pos_params = position_params or PositionParams()
-        self._calculate_positions(top_funds, pos_params)
+        # 仓位
+        pos = PositionParams(total_capital=total_capital)
+        risk_inv_sum = 0.0
+        for f in top:
+            vol = max(_safe_float(f.get("volatility_1y"), 15), 2.0)
+            f["_risk_inv"] = pos.risk_budget / vol
+            risk_inv_sum += f["_risk_inv"]
+        for f in top:
+            if risk_inv_sum > 0:
+                pct = (f["_risk_inv"] / risk_inv_sum) * pos.max_single_fund_pct * len(top) / 100 * 100
+            else:
+                pct = pos.max_single_fund_pct / len(top)
+            pct = max(1.0, min(pct, pos.max_single_fund_pct))
+            f["position_pct"] = round(pct, 1)
+            f["position_amount"] = round(pos.total_capital * pct / 100, 0)
 
-        # --- 输出 ---
+        # 构建输出
         results = []
-        for f in top_funds:
-            op = self._operation_from_score(f["composite_score"])
+        for f in top:
+            cs = f["composite_score"]
+            if cs >= 75:
+                op = "buy_heavy"
+            elif cs >= 60:
+                op = "buy"
+            elif cs >= 45:
+                op = "hold"
+            elif cs >= 30:
+                op = "reduce"
+            else:
+                op = "sell"
+
             qs = QuantScore(
-                fund_code=f["fund_code"],
-                fund_name=f["fund_name"],
-                fund_type=f["fund_type"],
-                return_score=round(f["return_score"], 1),
-                risk_score=round(f["risk_score"], 1),
-                manager_score=round(f["manager_score"], 1),
-                macro_score=round(f["macro_score"], 1),
-                stability_score=round(f["stability_score"], 1),
-                composite_score=round(f["composite_score"], 1),
-                suggested_position_pct=round(f.get("position_pct", 0), 1),
-                suggested_amount=round(f.get("position_amount", 0), 0),
+                fund_code=f["fund_code"], fund_name=f["fund_name"], fund_type=f["fund_type"],
+                return_score=round(f["return_score"], 1), risk_score=round(f["risk_score"], 1),
+                manager_score=round(f["manager_score"], 1), macro_score=round(f["macro_score"], 1),
+                stability_score=round(f["stability_score"], 1), composite_score=round(cs, 1),
+                suggested_position_pct=f["position_pct"], suggested_amount=f["position_amount"],
                 operation=op,
-                summary=self._build_summary(f),
-                strengths=self._build_strengths(f),
-                weaknesses=self._build_weaknesses(f),
+                summary=self._summary(cs),
+                strengths=self._strengths(f),
+                weaknesses=self._weaknesses(f),
             )
             results.append(qs)
-
         return results
 
-    def _calculate_positions(self, funds: List[Dict], params: PositionParams):
-        """风险预算仓位分配"""
-        if not funds:
-            return
+    def _summary(self, score):
+        if score >= 75: return f"综合得分 {score:.0f}/100，各项指标优秀，建议作为核心配置"
+        if score >= 60: return f"综合得分 {score:.0f}/100，整体良好，适合适量配置"
+        if score >= 45: return f"综合得分 {score:.0f}/100，表现中规中矩，建议观望"
+        return f"综合得分 {score:.0f}/100，多项指标不佳，暂不建议买入"
 
-        # 风险倒数权重
-        risk_inv_sum = 0.0
-        for f in funds:
-            vol = _safe_float(f.get("volatility_1y"), 15)
-            vol = max(vol, 2.0)  # 最低波动 2%
-            f["_risk_inv"] = params.risk_budget / vol
-            risk_inv_sum += f["_risk_inv"]
-
-        if risk_inv_sum <= 0:
-            eq_pct = params.max_single_fund_pct / len(funds)
-            for f in funds:
-                f["position_pct"] = round(eq_pct, 1)
-                f["position_amount"] = round(params.total_capital * eq_pct / 100, 0)
-            return
-
-        for f in funds:
-            raw_pct = (f["_risk_inv"] / risk_inv_sum) * params.max_single_fund_pct * len(funds) / 100 * 100
-            pct = min(raw_pct, params.max_single_fund_pct)
-            pct = max(pct, 1.0)
-            f["position_pct"] = round(pct, 1)
-            f["position_amount"] = round(params.total_capital * pct / 100, 0)
-
-    def _operation_from_score(self, score: float) -> str:
-        if score >= 80:
-            return "buy_heavy"
-        elif score >= 65:
-            return "buy"
-        elif score >= 50:
-            return "hold"
-        elif score >= 35:
-            return "reduce"
-        else:
-            return "sell"
-
-    def _build_summary(self, f: Dict) -> str:
-        score = f["composite_score"]
-        if score >= 80:
-            return f"综合得分 {score:.0f}，各维度表现优秀，适合作为核心仓位。"
-        elif score >= 65:
-            return f"综合得分 {score:.0f}，整体良好，可适当配置。"
-        elif score >= 50:
-            return f"综合得分 {score:.0f}，表现中规中矩，建议观望。"
-        else:
-            return f"综合得分 {score:.0f}，多个维度不佳，谨慎对待。"
-
-    def _build_strengths(self, f: Dict) -> List[str]:
+    def _strengths(self, f):
         s = []
-        if f["return_score"] >= 70:
-            s.append("历史收益优异")
-        if f["risk_score"] >= 70:
-            s.append("风险控制良好（高夏普/低回撤）")
-        if f["manager_score"] >= 70:
-            s.append("基金经理经验丰富")
-        if f["stability_score"] >= 70:
-            s.append("业绩排名稳定")
-        if f.get("pass_4433"):
-            s.append("通过4433法则筛选")
-        return s[:3] if s else ["综合表现均衡"]
+        if f["return_score"] >= 70: s.append("历史收益优异")
+        if f["risk_score"] >= 70: s.append("风险控制优秀")
+        if f["manager_score"] >= 70: s.append("基金经理经验丰富")
+        if f["stability_score"] >= 70: s.append("业绩稳定性好")
+        if f.get("pass_4433"): s.append("通过4433经典筛选")
+        return s[:3] if s else ["各维度表现均衡"]
 
-    def _build_weaknesses(self, f: Dict) -> List[str]:
+    def _weaknesses(self, f):
         w = []
-        if f["return_score"] <= 30:
-            w.append("历史收益偏弱")
-        if f["risk_score"] <= 30:
-            w.append("风险调整收益不足")
-        if f["manager_score"] <= 30:
-            w.append("基金经理经验待验证")
-        if f["stability_score"] <= 30:
-            w.append("业绩波动较大")
-        if f.get("max_drawdown_1y", 0) > 25:
-            w.append("最大回撤较高")
+        if f["return_score"] <= 30: w.append("历史收益偏弱")
+        if f["risk_score"] <= 30: w.append("风险调整后收益不足")
+        if f["manager_score"] <= 30: w.append("基金经理需进一步观察")
+        if f["stability_score"] <= 30: w.append("排名波动较大")
         return w[:3] if w else []
 
-    def _estab_years(self, date_str: str) -> float:
-        if not date_str or date_str == "--":
-            return 0
-        try:
-            dt = datetime.strptime(date_str[:10], "%Y-%m-%d")
-            return (datetime.now() - dt).days / 365.0
-        except ValueError:
-            return 0
-
-    # ------------------------------------------------------------------
-    # 2. 智能买入策略回测
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # 智能买入策略回测（保留原逻辑，增加 AI 结果解读）
+    # ==================================================================
 
     def backtest_advanced(self, db, params: BacktestAdvancedParams) -> Dict[str, Any]:
-        """
-        高级回测，支持四种策略：
-
-        - dca (定投): 每月固定金额
-        - value_averaging (价值平均): 目标市值增长，低位多买高位少买
-        - grid (网格): 净值下跌 grid_step% 买入，上涨 grid_step% 卖出
-        - adaptive (自适应): 参考 PE 分位调整投入（需 pe_series）
-        """
         from models import FundTrend
-
         trend = db.query(FundTrend).filter(FundTrend.fund_code == params.fund_code).first()
         if not trend:
-            return {"error": f"Fund {params.fund_code} not found"}
+            return {"error": f"Fund {params.fund_code} not found", "success": False}
 
         raw = _json_loads(trend.net_worth_trend_json, [])
         nav_dict = {}
@@ -498,31 +635,25 @@ class QuantService:
             d = item.get("date", "")
             n = item.get("net_worth")
             if d and n is not None:
-                try:
-                    nav_dict[d] = float(n)
-                except (ValueError, TypeError):
-                    continue
+                try: nav_dict[d] = float(n)
+                except (ValueError, TypeError): continue
 
         sorted_dates = sorted(nav_dict.keys())
         if len(sorted_dates) < 2:
-            return {"error": "Insufficient NAV data"}
+            return {"error": "Insufficient NAV data", "success": False}
 
-        # 日期过滤
         start_dt = self._parse_date(params.start_date)
         end_dt = self._parse_date(params.end_date) if params.end_date else datetime.now()
         dates = [d for d in sorted_dates if start_dt <= self._parse_date(d) <= end_dt]
         if len(dates) < 2:
-            return {"error": f"Insufficient data in range. Found {len(dates)} records."}
+            return {"error": f"只找到 {len(dates)} 条净值记录", "success": False}
 
         nav_dict = {d: nav_dict[d] for d in dates}
-
-        # PE 序列处理
         pe_dict = {}
         if params.pe_series:
             for pe in params.pe_series:
                 pe_dict[pe.get("date", "")] = pe.get("pe_percentile", 50)
 
-        # 执行回测
         if params.strategy == "value_averaging":
             result = self._backtest_value_averaging(dates, nav_dict, params)
         elif params.strategy == "grid":
@@ -534,499 +665,231 @@ class QuantService:
 
         result["strategy"] = params.strategy
         result["fund_code"] = params.fund_code
+        result["success"] = True
+
+        # 用 AI 解读回测结果
+        if self.ai_available and len(result.get("timeline", [])) > 10:
+            ai_text = self._call_llm(
+                system_prompt="你是一位量化回测分析师。请解读回测结果，用通俗语言解释给投资新手。输出 JSON：{\"verdict\": \"策略优秀/良好/一般/不推荐\", \"explanation\": \"通俗解释（100字内）\", \"best_for\": \"适合什么样的投资者\", \"caveat\": \"需要注意的风险\"}",
+                user_prompt=f"策略: {params.strategy}, 最终收益率: {result.get('final_return_rate', 0):.1f}%, 年化: {result.get('annualized_return', 0):.1f}%, 最大回撤: {result.get('max_drawdown', 0):.1f}%, 总投入: {result.get('total_invested', 0):.0f}, 最终市值: {result.get('final_value', 0):.0f}",
+                max_tokens=512,
+            )
+            result["ai_interpretation"] = self._parse_json_from_llm(ai_text) if ai_text else None
+
         return result
 
-    def _backtest_dca(self, dates, nav_dict, p: BacktestAdvancedParams) -> Dict:
-        """普通定投"""
-        total_invested = 0.0
-        total_shares = 0.0
-        timeline = []
-
-        current_month = None
+    def _backtest_dca(self, dates, nav_dict, p):
+        total_invested = 0.0; total_shares = 0.0; timeline = []; current_month = None
         for date in dates:
-            nav = nav_dict[date]
-            dt = self._parse_date(date)
-            month_key = (dt.year, dt.month)
-
+            nav = nav_dict[date]; dt = self._parse_date(date); month_key = (dt.year, dt.month)
             is_invest = False
             if month_key != current_month:
                 fee = p.base_amount * p.fee_rate / 100
-                shares = (p.base_amount - fee) / nav
-                total_shares += shares
-                total_invested += p.base_amount
-                current_month = month_key
-                is_invest = True
+                total_shares += (p.base_amount - fee) / nav
+                total_invested += p.base_amount; current_month = month_key; is_invest = True
+            value = total_shares * nav; ret_pct = (value - total_invested) / total_invested * 100 if total_invested > 0 else 0
+            timeline.append({"date": date, "nav": round(nav, 4), "invested": round(total_invested, 2), "value": round(value, 2), "return_rate": round(ret_pct, 2), "is_invest_day": is_invest})
+        return self._finalize(timeline, total_invested)
 
-            value = total_shares * nav
-            ret = value - total_invested
-            ret_pct = (ret / total_invested * 100) if total_invested > 0 else 0
-
-            timeline.append({
-                "date": date, "nav": round(nav, 4),
-                "invested": round(total_invested, 2),
-                "value": round(value, 2),
-                "return_rate": round(ret_pct, 2),
-                "is_invest_day": is_invest,
-            })
-
-        return self._finalize_result(timeline, total_invested)
-
-    def _backtest_value_averaging(self, dates, nav_dict, p: BacktestAdvancedParams) -> Dict:
-        """
-        价值平均策略：目标市值每月增长 base_amount
-        市值不足时补仓，超过目标时赎回
-        """
-        total_invested = 0.0
-        total_shares = 0.0
-        cash = 0.0
-        timeline = []
-        target_value = 0.0
-        month_count = 0
-        current_month = None
-
+    def _backtest_value_averaging(self, dates, nav_dict, p):
+        total_invested = 0.0; total_shares = 0.0; cash = 0.0; timeline = []; target_value = 0.0; month_count = 0; current_month = None
         for date in dates:
-            nav = nav_dict[date]
-            dt = self._parse_date(date)
-            month_key = (dt.year, dt.month)
-
-            is_action = False
-            action_type = ""
+            nav = nav_dict[date]; dt = self._parse_date(date); month_key = (dt.year, dt.month)
+            is_action = False; action_type = ""
             if month_key != current_month:
-                month_count += 1
-                target_value = p.base_amount * month_count
-                current_value = total_shares * nav
-                gap = target_value - current_value
-
-                if gap > p.base_amount * 0.1:  # 缺口 > 10%
-                    # 低估值，多买（当前市值 < 目标）
+                month_count += 1; target_value = p.base_amount * month_count
+                gap = target_value - total_shares * nav
+                if gap > p.base_amount * 0.1:
                     buy_amount = min(gap, p.base_amount * 2)
-                    fee = buy_amount * p.fee_rate / 100
-                    total_shares += (buy_amount - fee) / nav
-                    total_invested += buy_amount
-                    is_action = True
-                    action_type = "buy"
-                elif gap < -p.base_amount * 0.2:  # 超额 > 20%
-                    # 赎回超额部分
-                    sell_amount = min(-gap, current_value * 0.1)
-                    sell_shares = sell_amount / nav
-                    total_shares -= sell_shares
-                    cash += sell_amount
-                    is_action = True
-                    action_type = "sell"
-
+                    total_shares += (buy_amount * (1 - p.fee_rate / 100)) / nav
+                    total_invested += buy_amount; is_action = True; action_type = "buy"
+                elif gap < -p.base_amount * 0.2:
+                    sell_amount = min(-gap, total_shares * nav * 0.1)
+                    total_shares -= sell_amount / nav; cash += sell_amount; is_action = True; action_type = "sell"
                 current_month = month_key
+            value = total_shares * nav + cash; ret_pct = (value - total_invested) / total_invested * 100 if total_invested > 0 else 0
+            timeline.append({"date": date, "nav": round(nav, 4), "invested": round(total_invested, 2), "value": round(value, 2), "return_rate": round(ret_pct, 2), "is_action_day": is_action, "action": action_type, "target_value": round(target_value, 2)})
+        return self._finalize(timeline, total_invested)
 
-            value = total_shares * nav + cash
-            ret = value - total_invested
-            ret_pct = (ret / total_invested * 100) if total_invested > 0 else 0
-
-            timeline.append({
-                "date": date, "nav": round(nav, 4),
-                "invested": round(total_invested, 2),
-                "value": round(value, 2),
-                "return_rate": round(ret_pct, 2),
-                "is_action_day": is_action,
-                "action": action_type,
-                "target_value": round(target_value, 2),
-            })
-
-        return self._finalize_result(timeline, total_invested)
-
-    def _backtest_grid(self, dates, nav_dict, p: BacktestAdvancedParams) -> Dict:
-        """
-        网格交易：以初始净值为基准，每跌 grid_step% 买入一份，每涨 grid_step% 卖出一份
-        """
-        total_invested = 0.0
-        total_shares = 0.0
-        cash = 0.0
-        timeline = []
-        base_nav = nav_dict[dates[0]]
-        last_grid_buy = base_nav
-        last_grid_sell = base_nav
-        grid_amount = p.base_amount
-
+    def _backtest_grid(self, dates, nav_dict, p):
+        total_invested = 0.0; total_shares = 0.0; cash = 0.0; timeline = []
+        base_nav = nav_dict[dates[0]]; last_buy = base_nav; last_sell = base_nav; grid_amt = p.base_amount
         for date in dates:
-            nav = nav_dict[date]
-            is_action = False
-            action_type = ""
+            nav = nav_dict[date]; is_action = False; action_type = ""
+            if nav <= last_buy * (1 - p.grid_step / 100):
+                total_shares += (grid_amt * (1 - p.fee_rate / 100)) / nav
+                total_invested += grid_amt; last_buy = nav; is_action = True; action_type = "grid_buy"
+            if total_shares > 0 and nav >= last_sell * (1 + p.grid_step / 100):
+                sell_shares = min(grid_amt / nav, total_shares * 0.2)
+                total_shares -= sell_shares; cash += sell_shares * nav; last_sell = nav; is_action = True; action_type = "grid_sell"
+            value = total_shares * nav + cash; ret_pct = (value - total_invested) / total_invested * 100 if total_invested > 0 else 0
+            timeline.append({"date": date, "nav": round(nav, 4), "invested": round(total_invested, 2), "value": round(value, 2), "return_rate": round(ret_pct, 2), "is_action_day": is_action, "action": action_type})
+        return self._finalize(timeline, total_invested)
 
-            # 触发买入网格
-            if nav <= last_grid_buy * (1 - p.grid_step / 100):
-                fee = grid_amount * p.fee_rate / 100
-                shares = (grid_amount - fee) / nav
-                total_shares += shares
-                total_invested += grid_amount
-                last_grid_buy = nav
-                is_action = True
-                action_type = "grid_buy"
-
-            # 触发卖出网格
-            if total_shares > 0 and nav >= last_grid_sell * (1 + p.grid_step / 100):
-                sell_shares = min(grid_amount / nav, total_shares * 0.2)
-                total_shares -= sell_shares
-                cash += sell_shares * nav
-                last_grid_sell = nav
-                is_action = True
-                action_type = "grid_sell"
-
-            value = total_shares * nav + cash
-            ret = value - total_invested
-            ret_pct = (ret / total_invested * 100) if total_invested > 0 else 0
-
-            timeline.append({
-                "date": date, "nav": round(nav, 4),
-                "invested": round(total_invested, 2),
-                "value": round(value, 2),
-                "return_rate": round(ret_pct, 2),
-                "is_action_day": is_action,
-                "action": action_type,
-                "grid_level": round((last_grid_buy - base_nav) / base_nav * 100 / p.grid_step) if p.grid_step > 0 else 0,
-            })
-
-        return self._finalize_result(timeline, total_invested)
-
-    def _backtest_adaptive(self, dates, nav_dict, pe_dict, p: BacktestAdvancedParams) -> Dict:
-        """
-        自适应定投：PE 分位低时加倍投入，高时减半
-        PE 分位映射：
-        < 20% → 2× 基准
-        20-40% → 1.5×
-        40-70% → 1×
-        70-85% → 0.5×
-        > 85% → 暂停
-        """
-        total_invested = 0.0
-        total_shares = 0.0
-        timeline = []
-        current_month = None
-
-        def pe_multiplier(pe_pct):
-            if pe_pct <= 20:
-                return 2.0
-            elif pe_pct <= 40:
-                return 1.5
-            elif pe_pct <= 70:
-                return 1.0
-            elif pe_pct <= 85:
-                return 0.5
-            else:
-                return 0.0
-
+    def _backtest_adaptive(self, dates, nav_dict, pe_dict, p):
+        total_invested = 0.0; total_shares = 0.0; timeline = []; current_month = None
+        def mult(x):
+            if x <= 20: return 2.0
+            elif x <= 40: return 1.5
+            elif x <= 70: return 1.0
+            elif x <= 85: return 0.5
+            else: return 0.0
         for date in dates:
-            nav = nav_dict[date]
-            dt = self._parse_date(date)
-            month_key = (dt.year, dt.month)
-
-            is_invest = False
-            multiplier = 1.0
+            nav = nav_dict[date]; dt = self._parse_date(date); month_key = (dt.year, dt.month)
+            is_invest = False; m = 1.0
             if month_key != current_month:
-                pe_pct = pe_dict.get(date, 50)
-                multiplier = pe_multiplier(pe_pct)
-                if multiplier > 0:
-                    amount = p.base_amount * multiplier
-                    fee = amount * p.fee_rate / 100
-                    shares = (amount - fee) / nav
-                    total_shares += shares
-                    total_invested += amount
-                current_month = month_key
-                is_invest = True
+                pe_pct = pe_dict.get(date, 50); m = mult(pe_pct)
+                if m > 0:
+                    amt = p.base_amount * m
+                    total_shares += (amt * (1 - p.fee_rate / 100)) / nav
+                    total_invested += amt
+                current_month = month_key; is_invest = True
+            value = total_shares * nav; ret_pct = (value - total_invested) / total_invested * 100 if total_invested > 0 else 0
+            timeline.append({"date": date, "nav": round(nav, 4), "invested": round(total_invested, 2), "value": round(value, 2), "return_rate": round(ret_pct, 2), "is_invest_day": is_invest, "pe_multiplier": m})
+        return self._finalize(timeline, total_invested)
 
-            value = total_shares * nav
-            ret = value - total_invested
-            ret_pct = (ret / total_invested * 100) if total_invested > 0 else 0
-
-            timeline.append({
-                "date": date, "nav": round(nav, 4),
-                "invested": round(total_invested, 2),
-                "value": round(value, 2),
-                "return_rate": round(ret_pct, 2),
-                "is_invest_day": is_invest,
-                "pe_multiplier": multiplier,
-            })
-
-        return self._finalize_result(timeline, total_invested)
-
-    def _finalize_result(self, timeline, total_invested):
-        if not timeline:
-            return {"error": "Empty timeline"}
+    def _finalize(self, timeline, total_invested):
+        if not timeline: return {"error": "Empty timeline"}
         last = timeline[-1]
-        peak_value = max(t["value"] for t in timeline)
-        max_drawdown = 0.0
-        peak_so_far = 0.0
+        peak_val = max(t["value"] for t in timeline)
+        dd = 0.0; peak = 0.0
         for t in timeline:
-            if t["value"] > peak_so_far:
-                peak_so_far = t["value"]
-            dd = (peak_so_far - t["value"]) / peak_so_far * 100 if peak_so_far > 0 else 0
-            max_drawdown = max(max_drawdown, dd)
-
+            peak = max(peak, t["value"])
+            if peak > 0:
+                dd = max(dd, (peak - t["value"]) / peak * 100)
         days = len(timeline)
-        annual_return = ((1 + last["return_rate"] / 100) ** (365 / max(days, 1)) - 1) * 100
-
+        ann = ((1 + last["return_rate"] / 100) ** (365 / max(days, 1)) - 1) * 100
         return {
-            "total_invested": round(total_invested, 2),
-            "final_value": last["value"],
-            "final_return_rate": last["return_rate"],
-            "annualized_return": round(annual_return, 2),
-            "max_drawdown": round(max_drawdown, 2),
-            "peak_value": round(peak_value, 2),
+            "total_invested": round(total_invested, 2), "final_value": last["value"],
+            "final_return_rate": last["return_rate"], "annualized_return": round(ann, 2),
+            "max_drawdown": round(dd, 2), "peak_value": round(peak_val, 2),
             "investment_count": sum(1 for t in timeline if t.get("is_invest_day") or t.get("is_action_day")),
             "timeline": timeline,
         }
 
-    def _parse_date(self, s: str):
+    def _parse_date(self, s):
         for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
-            try:
-                return datetime.strptime(s[:10], fmt)
-            except (ValueError, IndexError):
-                continue
+            try: return datetime.strptime(s[:10], fmt)
+            except (ValueError, IndexError): continue
         return datetime(2000, 1, 1)
 
-    # ------------------------------------------------------------------
-    # 3. 动态卖出信号
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # 动态卖出信号
+    # ==================================================================
 
     def exit_signals(self, db, fund_code: str) -> Dict[str, Any]:
-        """
-        综合卖出信号检测，返回五维信号灯：
-
-        1. 估值过热 — PE 分位 > 70% 且浮盈 > 20%
-        2. 趋势破位 — 收盘价低于 MA60
-        3. 经理变更 — 基金经理近期更换
-        4. 规模暴增 — 规模半年增长 > 100%
-        5. 止损触发 — 近1年最大回撤 > 25%
-
-        Returns:
-            {
-                "fund_code": "xxx",
-                "signals": [
-                    {"name": "估值过热", "level": "red"|"yellow"|"green", "score": 0-100, "detail": "..."},
-                    ...
-                ],
-                "exit_score": 0-100,  # 越高越该卖出
-                "recommendation": "持有"|"减仓"|"清仓"|"观望",
-                "summary": "..."
-            }
-        """
         from models import FundBasicInfo, FundTrend, FundRiskMetrics, FundExtraData
-
         basic = db.query(FundBasicInfo).filter(FundBasicInfo.fund_code == fund_code).first()
-        if not basic:
-            return {"error": f"Fund {fund_code} not found"}
-
+        if not basic: return {"error": f"Fund {fund_code} not found"}
         trend = db.query(FundTrend).filter(FundTrend.fund_code == fund_code).first()
         risk = db.query(FundRiskMetrics).filter(FundRiskMetrics.fund_code == fund_code).first()
         extra = db.query(FundExtraData).filter(FundExtraData.fund_code == fund_code).first()
 
+        perf = _json_loads(basic.performance_json)
+        return_1y = _safe_float(basic.return_1y or perf.get("1_year_return", 0))
         signals = []
 
-        # --- 1. 估值过热 ---
-        perf = _json_loads(basic.performance_json)
-        return_1y = _safe_float(basic.return_1y or _safe_float(perf.get("1_year_return", 0)))
-        pe_level = "green"
-        if return_1y > 30:
-            pe_level = "red"
-            score = 80
-            detail = f"近1年涨幅 {return_1y:.1f}%，已大幅偏离均值，估值可能偏高"
-        elif return_1y > 15:
-            pe_level = "yellow"
-            score = 45
-            detail = f"近1年涨幅 {return_1y:.1f}%，注意估值风险"
-        else:
-            score = 10
-            detail = f"近1年涨幅 {return_1y:.1f}%，估值合理"
-        signals.append({"name": "估值过热", "level": pe_level, "score": score, "detail": detail})
+        # 1. 估值
+        if return_1y > 30: sig = ("red", 80, f"近1年涨幅 {return_1y:.1f}% 过高")
+        elif return_1y > 15: sig = ("yellow", 45, f"近1年涨幅 {return_1y:.1f}% 偏高")
+        else: sig = ("green", 10, f"近1年涨幅 {return_1y:.1f}% 合理")
+        signals.append({"name": "估值过热", "level": sig[0], "score": sig[1], "detail": sig[2]})
 
-        # --- 2. 趋势破位 ---
+        # 2. 趋势
         nav_data = _json_loads(trend.net_worth_trend_json if trend else "[]", [])
-        ma_broken = False
         if len(nav_data) >= 60:
             recent = nav_data[-60:]
             navs = [_safe_float(x.get("net_worth", 0)) for x in recent]
-            valid_navs = [n for n in navs if n > 0]
-            if len(valid_navs) >= 30:
-                ma60 = sum(valid_navs) / len(valid_navs)
-                latest = valid_navs[-1]
-                if latest < ma60 * 0.95:
-                    ma_broken = True
-                    signals.append({"name": "趋势破位", "level": "red", "score": 75,
-                                    "detail": f"当前净值 {latest:.4f} 低于60日均值 {ma60:.4f} 超5%"})
-                elif latest < ma60:
-                    signals.append({"name": "趋势破位", "level": "yellow", "score": 40,
-                                    "detail": f"当前净值 {latest:.4f} 略低于60日均值 {ma60:.4f}"})
-                else:
-                    signals.append({"name": "趋势破位", "level": "green", "score": 5,
-                                    "detail": f"净值在60日均线上方，趋势良好"})
-            else:
-                signals.append({"name": "趋势破位", "level": "green", "score": 0, "detail": "数据不足"})
-        else:
-            signals.append({"name": "趋势破位", "level": "green", "score": 0, "detail": "数据不足"})
+            valid = [n for n in navs if n > 0]
+            if len(valid) >= 30:
+                ma60 = sum(valid) / len(valid); latest = valid[-1]
+                if latest < ma60 * 0.95: sig = ("red", 75, f"净值 {latest:.4f} 远低于60日均线 {ma60:.4f}")
+                elif latest < ma60: sig = ("yellow", 40, f"净值 {latest:.4f} 略低于60日均线")
+                else: sig = ("green", 5, "净值在60日均线上方")
+            else: sig = ("green", 0, "数据不足")
+        else: sig = ("green", 0, "数据不足")
+        signals.append({"name": "趋势破位", "level": sig[0], "score": sig[1], "detail": sig[2]})
 
-        # --- 3. 经理变更 ---
+        # 3. 经理
         mgr = _json_loads(extra.fund_managers_json if extra else "[]", [])
-        if isinstance(mgr, dict):
-            mgr = [mgr]
+        if isinstance(mgr, dict): mgr = [mgr]
         mgr_days = _safe_float(mgr[0].get("manage_days", 365)) if mgr else 365
-        if mgr_days < 180:
-            signals.append({"name": "经理变更", "level": "red", "score": 80,
-                            "detail": f"基金经理任职仅 {mgr_days:.0f} 天，需观察"})
-        elif mgr_days < 365:
-            signals.append({"name": "经理变更", "level": "yellow", "score": 30,
-                            "detail": f"基金经理任职不足1年"})
-        else:
-            signals.append({"name": "经理变更", "level": "green", "score": 0,
-                            "detail": "基金经理任职稳定"})
+        if mgr_days < 180: sig = ("red", 80, f"基金经理任职仅 {mgr_days:.0f} 天")
+        elif mgr_days < 365: sig = ("yellow", 30, "基金经理任职不足1年")
+        else: sig = ("green", 0, "基金经理任职稳定")
+        signals.append({"name": "经理变更", "level": sig[0], "score": sig[1], "detail": sig[2]})
 
-        # --- 4. 规模暴增 ---
+        # 4. 规模
+        sig = ("green", 0, "规模数据不足")
         scale_json = _json_loads(trend.scale_fluctuation_json if trend else "[]", [])
-        scale_warning = False
         if isinstance(scale_json, list) and len(scale_json) >= 2:
-            scales = []
-            for item in scale_json:
-                s = _safe_float(item.get("scale")) if isinstance(item, dict) else _safe_float(item)
-                if s > 0:
-                    scales.append(s)
+            scales = [_safe_float(x.get("scale")) if isinstance(x, dict) else _safe_float(x) for x in scale_json]
+            scales = [s for s in scales if s > 0]
             if len(scales) >= 2:
                 growth = (scales[-1] - scales[0]) / scales[0] * 100
-                if growth > 100:
-                    scale_warning = True
-                    signals.append({"name": "规模暴增", "level": "red", "score": 60,
-                                    "detail": f"基金规模增长 {growth:.0f}%，可能拖累收益"})
-                elif growth > 50:
-                    signals.append({"name": "规模暴增", "level": "yellow", "score": 30,
-                                    "detail": f"基金规模增长 {growth:.0f}%"})
-                else:
-                    signals.append({"name": "规模暴增", "level": "green", "score": 5,
-                                    "detail": "规模变化正常"})
-            else:
-                signals.append({"name": "规模暴增", "level": "green", "score": 0, "detail": "数据不足"})
-        else:
-            signals.append({"name": "规模暴增", "level": "green", "score": 0, "detail": "数据不足"})
+                if growth > 100: sig = ("red", 60, f"规模暴增 {growth:.0f}%")
+                elif growth > 50: sig = ("yellow", 30, f"规模增长 {growth:.0f}%")
+                else: sig = ("green", 5, f"规模变化 {growth:.0f}% 正常")
+        signals.append({"name": "规模暴增", "level": sig[0], "score": sig[1], "detail": sig[2]})
 
-        # --- 5. 止损触发 ---
+        # 5. 止损
         max_dd = _safe_float(risk.max_drawdown_1y if risk else 0)
-        if max_dd > 25:
-            signals.append({"name": "止损触发", "level": "red", "score": 80,
-                            "detail": f"近1年最大回撤 {max_dd:.1f}%，超过25%警戒线"})
-        elif max_dd > 15:
-            signals.append({"name": "止损触发", "level": "yellow", "score": 35,
-                            "detail": f"近1年最大回撤 {max_dd:.1f}%，注意风险"})
-        else:
-            signals.append({"name": "止损触发", "level": "green", "score": 5,
-                            "detail": f"近1年最大回撤 {max_dd:.1f}%，风险可控"})
+        if max_dd > 25: sig = ("red", 80, f"近1年最大回撤 {max_dd:.1f}% 超警戒")
+        elif max_dd > 15: sig = ("yellow", 35, f"近1年最大回撤 {max_dd:.1f}%")
+        else: sig = ("green", 5, f"近1年最大回撤 {max_dd:.1f}% 可控")
+        signals.append({"name": "止损触发", "level": sig[0], "score": sig[1], "detail": sig[2]})
 
-        # --- 综合 ---
         reds = sum(1 for s in signals if s["level"] == "red")
         yellows = sum(1 for s in signals if s["level"] == "yellow")
         exit_score = sum(s["score"] for s in signals) / max(len(signals), 1)
 
-        if reds >= 2:
-            recommendation = "清仓"
-        elif reds >= 1:
-            recommendation = "减仓"
-        elif yellows >= 2:
-            recommendation = "观望"
-        else:
-            recommendation = "持有"
+        if reds >= 2: recommendation = "清仓"
+        elif reds >= 1: recommendation = "减仓"
+        elif yellows >= 2: recommendation = "观望"
+        else: recommendation = "持有"
+
+        # AI 复核
+        ai_review = None
+        if self.ai_available:
+            ai_text = self._call_llm(
+                system_prompt="你是一位风控专家。请基于卖出信号综合判断是否该卖出，输出 JSON：{\"agree\": true/false, \"confidence\": 0-100, \"action\": \"立即清仓/逐步减仓/暂时持有/逢高卖出\", \"explanation\": \"你的判断理由（80字内）\"}",
+                user_prompt=f"基金: {basic.fund_name}({fund_code}), 卖出评分: {exit_score:.0f}/100, 信号: " + ", ".join(f"{s['name']}={s['level']}" for s in signals),
+                max_tokens=512,
+            )
+            ai_review = self._parse_json_from_llm(ai_text) if ai_text else None
 
         return {
-            "fund_code": fund_code,
-            "fund_name": basic.fund_name,
-            "signals": signals,
-            "exit_score": round(exit_score, 1),
+            "fund_code": fund_code, "fund_name": basic.fund_name,
+            "signals": signals, "exit_score": round(exit_score, 1),
             "recommendation": recommendation,
-            "summary": f"五维卖出信号综合评分 {exit_score:.0f}/100，建议{recommendation}。红色信号 {reds} 个，黄色 {yellows} 个。",
+            "summary": f"五维信号 {exit_score:.0f}/100，{recommendation}（🔴{reds} 🟡{yellows}）",
+            "ai_review": ai_review,
         }
 
-    # ------------------------------------------------------------------
-    # 4. AI 投资顾问提示构建
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # AI 投资顾问（给前端对话用的）
+    # ==================================================================
 
-    def build_advisor_prompt(
-        self,
-        db,
-        total_capital: float,
-        risk_profile: str,
-        investment_goal: str,
-        investment_horizon: str,
-        fund_codes: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+    def chat_advisor(
+        self, db, total_capital: float, risk_profile: str,
+        investment_goal: str, investment_horizon: str, fund_codes=None
+    ) -> Dict:
         """
-        构建 AI 投资顾问的完整上下文，包括：
-        - 用户画像（资金、风险偏好、目标）
-        - 当前市场概览
-        - 推荐基金打分表
-        - 仓位分配建议
+        等同于原来的 build_advisor_prompt，但现在 AI 真正参与决策。
+        这是给「AI 投资顾问」Tab 用的。
         """
-
-        # 打分
-        scores = self.score_funds(
-            db=db,
+        return self.ai_decide(
+            db=db, total_capital=total_capital, risk_profile=risk_profile,
+            investment_goal=investment_goal, investment_horizon=investment_horizon,
             fund_codes=fund_codes,
-            risk_profile=risk_profile,
-            position_params=PositionParams(total_capital=total_capital),
-            top_n=15,
         )
 
-        profile_desc = {
-            "conservative": "稳健型：追求资产保值增值，最大可承受回撤 10%，偏好低波动产品",
-            "balanced": "平衡型：追求适度增长，最大可承受回撤 20%",
-            "aggressive": "进取型：追求高回报，可承受较大波动，最大回撤 30%",
-            "momentum": "动量型：追逐市场趋势，关注短期表现和资金流向",
-        }.get(risk_profile, "平衡型")
 
-        horizon_desc = {
-            "short": "短期 (1年以内)",
-            "medium": "中期 (1-3年)",
-            "long": "长期 (3年以上)",
-        }.get(investment_horizon, "中期 (1-3年)")
-
-        user_info = f"""
-## 用户画像
-- 可用资金：{total_capital:,.0f} 元
-- 风险偏好：{profile_desc}
-- 投资目标：{investment_goal}
-- 投资期限：{horizon_desc}
-"""
-
-        fund_table_lines = ["## 推荐基金打分表\n"]
-        fund_table_lines.append("| 排名 | 基金名称 | 类型 | 综合分 | 收益 | 风险 | 经理 | 稳定性 | 建议仓位 | 操作 |")
-        fund_table_lines.append("|------|---------|------|--------|------|------|------|--------|----------|------|")
-        for i, s in enumerate(scores[:10], 1):
-            fund_table_lines.append(
-                f"| {i} | {s.fund_name}({s.fund_code}) | {s.fund_type} | {s.composite_score} | "
-                f"{s.return_score} | {s.risk_score} | {s.manager_score} | {s.stability_score} | "
-                f"{s.suggested_position_pct}% | {s.operation} |"
-            )
-
-        op_map = {"buy_heavy": "重仓买入", "buy": "建议买入", "hold": "持有观望", "reduce": "减仓", "sell": "卖出"}
-
-        fund_detail_lines = []
-        for s in scores[:5]:
-            fund_detail_lines.append(f"""
-### {s.fund_name} ({s.fund_code})
-- **综合评分**: {s.composite_score}/100
-- **买入建议**: {op_map.get(s.operation, s.operation)}
-- **建议仓位**: {s.suggested_position_pct}%（约 {s.suggested_amount:,.0f} 元）
-- **亮点**: {'; '.join(s.strengths)}
-- **注意**: {'; '.join(s.weaknesses)}
-""")
-
-        context = {
-            "user_info": user_info,
-            "fund_table": "\n".join(fund_table_lines),
-            "fund_details": "\n".join(fund_detail_lines),
-            "scores": [s.__dict__ for s in scores],
-        }
-
-        return context
-
-
-# ---------------------------------------------------------------------------
+# ============================================================================
 # 单例
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 _quant_service: Optional[QuantService] = None
-
 
 def get_quant_service() -> QuantService:
     global _quant_service

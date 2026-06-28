@@ -6945,22 +6945,61 @@ def _cleanup_stale_tasks_on_startup():
 
 # ==================== 量化分析 API ====================
 
-@app.route('/api/quant/score-funds', methods=['POST'])
-def quant_score_funds():
+@app.route('/api/quant/decide', methods=['POST'])
+def quant_ai_decide():
     """
-    多因子打分系统 — 买什么 + 买多少
+    AI 驱动的投资决策引擎 — 核心端点。
+
+    量化 + AI 二合一：
+    1. 后端计算标准化因子得分（收益/风险/经理/稳定性，0-100分）
+    2. 将所有数据发给 LLM（DeepSeek），让 AI 做最终决策
+    3. 返回结构化的买入/卖出方案
 
     POST JSON:
     {
-        "risk_profile": "balanced",     // conservative/balanced/aggressive/momentum
-        "fund_type": "股票型",           // 可选，筛选特定类型
-        "min_return_1y": 5,             // 可选，最低1年收益
-        "total_capital": 100000,        // 总资金
-        "max_single_fund_pct": 20,      // 单基最大仓位%
-        "top_n": 20,                    // 返回前N只
-        "fund_codes": ["161725", ...]   // 可选，限定基金范围（自选/对比）
+        "total_capital": 100000,
+        "risk_profile": "balanced",       // conservative/balanced/aggressive/momentum
+        "investment_goal": "长期增值",
+        "investment_horizon": "long",     // short/medium/long
+        "fund_type": "股票型",            // 可选
+        "fund_codes": [...]              // 可选，限定范围
     }
     """
+    try:
+        data = request.get_json() or {}
+        db = get_db()
+        qs = get_quant_service()
+
+        result = qs.ai_decide(
+            db=db,
+            total_capital=float(data.get("total_capital", 100000)),
+            risk_profile=data.get("risk_profile", "balanced"),
+            investment_goal=data.get("investment_goal", "长期资产增值"),
+            investment_horizon=data.get("investment_horizon", "long"),
+            fund_codes=data.get("fund_codes"),
+            fund_type=data.get("fund_type"),
+        )
+        return jsonify({"success": True, **result})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/api/quant/analyze/<fund_code>', methods=['GET'])
+def quant_ai_analyze_fund(fund_code):
+    """AI 深度分析单只基金"""
+    fund_code = _normalize_fund_code(fund_code)
+    db = get_db()
+    qs = get_quant_service()
+    result = qs.ai_analyze_single_fund(db, fund_code)
+    return jsonify({"success": "error" not in result, **result})
+
+
+@app.route('/api/quant/score-funds', methods=['POST'])
+def quant_score_funds():
+    """多因子打分（纯量化，不调用 LLM）"""
     try:
         data = request.get_json() or {}
         risk_profile = data.get("risk_profile", "balanced")
@@ -6980,15 +7019,9 @@ def quant_score_funds():
             max_total_funds=8,
         )
 
-        results = qs.score_funds(
-            db=db,
-            fund_codes=fund_codes,
-            fund_type=fund_type,
-            min_return_1y=min_return_1y,
-            risk_profile=risk_profile,
-            position_params=pos,
-            top_n=top_n,
-            min_estab_years=0,  # Skip estab filter since basic_json may lack est date
+        results = qs._score_funds_internal(
+            db=db, fund_codes=fund_codes, fund_type=fund_type,
+            risk_profile=risk_profile, total_capital=total_capital, top_n=top_n,
         )
 
         return jsonify({
@@ -7007,21 +7040,7 @@ def quant_score_funds():
 
 @app.route('/api/quant/backtest-advanced', methods=['POST'])
 def quant_backtest_advanced():
-    """
-    智能买入策略回测 — 怎么买
-
-    POST JSON:
-    {
-        "fund_code": "161725",
-        "start_date": "2020-01-01",
-        "end_date": "2023-12-31",
-        "strategy": "value_averaging",   // dca / value_averaging / grid / adaptive
-        "base_amount": 1000,
-        "fee_rate": 0.15,
-        "grid_step": 5,                  // grid 策略步长(%)
-        "pe_series": [...]               // adaptive 策略 PE序列（可选）
-    }
-    """
+    """智能买入策略回测"""
     try:
         data = request.get_json() or {}
         fund_code = data.get("fund_code", "")
@@ -7043,7 +7062,7 @@ def quant_backtest_advanced():
         )
 
         result = qs.backtest_advanced(db, params)
-        return jsonify({"success": "error" not in result, **result})
+        return jsonify(result)
 
     except Exception as e:
         import traceback
@@ -7053,46 +7072,39 @@ def quant_backtest_advanced():
 
 @app.route('/api/quant/strategies', methods=['GET'])
 def quant_get_strategies():
-    """返回所有支持的策略说明"""
-    strategies = {
+    """所有策略说明"""
+    return jsonify({
+        "ai_decision": {
+            "name": "AI 投资决策（推荐使用）",
+            "url": "/api/quant/decide",
+            "description": "AI 综合分析所有基金数据，给出完整的买入/卖出/仓位方案",
+        },
+        "ai_analyze": {
+            "name": "AI 单基金深度分析",
+            "url": "/api/quant/analyze/{fund_code}",
+            "description": "AI 深度分析单只基金的买卖时机、风险、建议",
+        },
         "scoring": {
             "name": "多因子打分",
             "url": "/api/quant/score-funds",
-            "description": "综合收益、风险、经理、稳定性四个维度打分，附带仓位建议",
-            "risk_profiles": {
-                "conservative": {"return": 15, "risk": 40, "manager": 15, "macro": 10, "stability": 20},
-                "balanced": {"return": 30, "risk": 30, "manager": 15, "macro": 10, "stability": 15},
-                "aggressive": {"return": 40, "risk": 20, "manager": 15, "macro": 15, "stability": 10},
-                "momentum": {"return": 45, "risk": 15, "manager": 10, "macro": 15, "stability": 15},
-            }
+            "description": "纯量化评分（不调用AI），四维度 0-100 分",
+            "risk_profiles": ["conservative", "balanced", "aggressive", "momentum"],
         },
         "backtest": {
             "name": "智能买入策略",
             "url": "/api/quant/backtest-advanced",
-            "strategies": {
-                "dca": "普通定投 — 每月固定金额买入，适合小白入门",
-                "value_averaging": "价值平均 — 目标市值增长，低位多买高位少买（推荐）",
-                "grid": "网格交易 — 每跌N%买入，每涨N%卖出，适合震荡市",
-                "adaptive": "自适应定投 — 依据PE估值分位调整投入倍数，低估值加倍",
-            }
+            "strategies": ["dca", "value_averaging", "grid", "adaptive"],
         },
         "exit_signals": {
             "name": "动态卖出信号",
             "url": "/api/quant/exit-signals/{fund_code}",
-            "signals": ["估值过热", "趋势破位", "经理变更", "规模暴增", "止损触发"],
         },
-        "advisor": {
-            "name": "AI投资顾问",
-            "url": "/api/quant/advisor-context",
-            "description": "构建完整上下文供AI分析，包括用户画像、市场概览、打分表",
-        }
-    }
-    return jsonify(strategies)
+    })
 
 
 @app.route('/api/quant/exit-signals/<fund_code>', methods=['GET'])
 def quant_exit_signals(fund_code):
-    """动态卖出信号检测"""
+    """动态卖出信号检测（含 AI 复核）"""
     fund_code = _normalize_fund_code(fund_code)
     db = get_db()
     qs = get_quant_service()
@@ -7102,24 +7114,12 @@ def quant_exit_signals(fund_code):
 
 @app.route('/api/quant/advisor-context', methods=['POST'])
 def quant_advisor_context():
-    """
-    构建 AI 投资顾问上下文
-
-    POST JSON:
-    {
-        "total_capital": 100000,
-        "risk_profile": "balanced",
-        "investment_goal": "为退休做准备",
-        "investment_horizon": "long",    // short/medium/long
-        "fund_codes": [...]              // 可选，自选基金列表
-    }
-    """
+    """AI 投资顾问（等同于 /api/quant/decide，语义化别名）"""
     try:
         data = request.get_json() or {}
         db = get_db()
         qs = get_quant_service()
-
-        context = qs.build_advisor_prompt(
+        result = qs.chat_advisor(
             db=db,
             total_capital=float(data.get("total_capital", 100000)),
             risk_profile=data.get("risk_profile", "balanced"),
@@ -7127,44 +7127,7 @@ def quant_advisor_context():
             investment_horizon=data.get("investment_horizon", "long"),
             fund_codes=data.get("fund_codes"),
         )
-
-        # 用 AI 服务做综合分析
-        ai = get_ai_service()
-        if ai.is_available():
-            ai_prompt = f"""{context['user_info']}
-
-{context['fund_table']}
-
-{context['fund_details']}
-
-你是一位专业的基金投资顾问。请基于以上用户画像和基金打分数据，用中文给出一份完整的新手投资建议：
-
-## 输出格式（严格JSON）：
-```json
-{{
-    "portfolio_plan": {{
-        "summary": "一句话总结投资建议",
-        "funds": [
-            {{"fund_code": "xxx", "fund_name": "xxx", "allocation_pct": xx, "reason": "..."}}
-        ],
-        "total_allocation": xx,
-        "cash_reserve": xx
-    }},
-    "buy_strategy": "推荐买入策略，含具体操作步骤",
-    "risk_management": "风险控制措施",
-    "rebalance_rule": "再平衡规则",
-    "learning_plan": "新手学习路径，包括关键指标解释"
-}}
-```"""
-
-            ai_result = ai._call_llm_simple(
-                prompt=ai_prompt,
-                system_prompt="你是一位耐心的基金投资教练，擅长用通俗语言解释专业概念。你的建议要具体、可执行、风险可控。"
-            )
-            context["ai_analysis"] = ai._parse_fund_analysis_result(ai_result) if ai_result else None
-
-        return jsonify({"success": True, **context})
-
+        return jsonify({"success": True, **result})
     except Exception as e:
         import traceback
         traceback.print_exc()
