@@ -57,6 +57,13 @@
             >
               投研看板
             </button>
+            <button
+              class="mode-btn mode-btn-ai"
+              :class="{ active: viewMode === 'quant' }"
+              @click="navigateToMode('quant')"
+            >
+              🤖 量化决策
+            </button>
           </div>
         </div>
       </div>
@@ -136,6 +143,11 @@
           <template v-else-if="viewMode === 'research'">
             <ResearchDashboard @view-fund="handleResearchFundView" />
           </template>
+
+          <!-- 量化决策 -->
+          <template v-else-if="viewMode === 'quant'">
+            <QuantAdvisor @view-fund="handleFundSelected" />
+          </template>
           
           <!-- 回测模式 -->
           <template v-else-if="viewMode === 'backtest'">
@@ -174,6 +186,7 @@ import FundScreening from './components/FundScreening.vue'
 import FundBacktest from './components/FundBacktest.vue'
 import FundRealtime from './components/FundRealtime.vue'
 import ResearchDashboard from './components/ResearchDashboard.vue'
+import QuantAdvisor from './components/QuantAdvisor.vue'
 import MarketOverview from './components/MarketOverview.vue'
 import FlashNews from './components/FlashNews.vue'
 import SectorRank from './components/SectorRank.vue'
@@ -191,7 +204,8 @@ export default {
     ResearchDashboard,
     MarketOverview,
     FlashNews,
-    SectorRank
+    SectorRank,
+    QuantAdvisor
   },
   setup() {
     const selectedFundCode = ref('')
