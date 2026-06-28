@@ -43,6 +43,8 @@ docker exec gofundbot bash /app/entrypoint.sh
 - **重启服务**：`docker restart gofundbot && sleep 8 && docker exec gofundbot bash /app/entrypoint.sh`
 - **看日志**：`docker exec gofundbot tail -f /var/log/supervisor/backend-stderr.log`
 - **容器内 git**：`docker exec gofundbot bash -c "cd /app && git pull"`
+- **容器内 commit & push**：`docker exec gofundbot bash -c "cd /app && git add -A && git commit -m 'xxx' && git push origin master"`
+- **Git 配置**：remote 已改为 SSH `git@github.com:zzzzes/GoFundBot.git`，用户 `Zes007`
 
 ## 重新安装依赖
 
