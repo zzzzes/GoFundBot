@@ -166,7 +166,8 @@ EOF'</code>
       <div v-if="btResult" class="grid-2col">
         <div v-for="(r,k) in btResult" :key="k" class="card">
           <h4>{{ strategyLabel(k) }}</h4>
-          <div class="metrics">
+          <div v-if="r.error" class="err" style="font-size:0.82rem">{{ r.error }}</div>
+          <div v-else class="metrics">
             <div class="m"><span class="ml">收益率</span><span class="mv" :class="(r.final_return_rate||0)>0?'up':'down'">{{ (r.final_return_rate||0).toFixed(1) }}%</span></div>
             <div class="m"><span class="ml">年化</span><span class="mv">{{ (r.annualized_return||0).toFixed(1) }}%</span></div>
             <div class="m"><span class="ml">最大回撤</span><span class="mv down">{{ (r.max_drawdown||0).toFixed(1) }}%</span></div>
@@ -243,16 +244,20 @@ export default {
     const bt = reactive({ code: '161725', start: '2021-01-01', amount: 1000 }); const bting = ref(false); const btResult = ref(null); const btError = ref(''); const btLoadingTip = ref('')
     const runBacktest = async () => {
       bting.value = true; btResult.value = null; btError.value = ''; btLoadingTip.value = ''
+      const code = bt.code.trim()
+      if (!code) { btError.value = '请输入基金代码'; bting.value = false; return }
       // 先确保基金有净值数据
       try {
         btLoadingTip.value = '正在加载净值数据...'
-        await api.get('/fund/' + bt.code.trim() + '?refresh=true')
+        await api.get('/fund/' + code + '?refresh=true')
         btLoadingTip.value = ''
       } catch (e) { btLoadingTip.value = '' }
+      // 串行请求四种策略（避免 DB 并发问题）
       const results = {}
-      for (const s of ['dca', 'value_averaging', 'grid', 'adaptive']) {
+      const strategies = ['dca', 'value_averaging', 'grid', 'adaptive']
+      for (const s of strategies) {
         try {
-          const x = await api.post('/quant/backtest-advanced', { fund_code: bt.code, start_date: bt.start, strategy: s, base_amount: bt.amount, fee_rate: 0.15 })
+          const x = await api.post('/quant/backtest-advanced', { fund_code: code, start_date: bt.start, strategy: s, base_amount: bt.amount, fee_rate: 0.15 })
           results[s] = x.data
         } catch (e) { results[s] = { error: e.response?.data?.error || e.message } }
       }
