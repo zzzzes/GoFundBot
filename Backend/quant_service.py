@@ -69,11 +69,19 @@ def _none_to(val: Any, fallback: float) -> float:
         return fallback
 
 def _normalize_in_place(funds: List[Dict], key: str, invert: bool = False):
-    """对 fund dict[key] 做 min-max 归一化到 0-100"""
+    """对 fund dict[key] 做 min-max 归一化到 0-100。小样本时 clamp 防止极端值"""
     vals = [_safe_float(f.get(key)) for f in funds]
     valid = [v for v in vals if v != 0.0]
-    if not valid:
+    n = len(valid)
+    if n == 0:
         lo, hi = 0.0, 100.0
+    elif n < 10:
+        # 小样本夹紧：用 20/80 分位数代替 min/max，避免极端值
+        sv = sorted(valid)
+        lo = sv[int(n * 0.2)] if n >= 5 else sv[0]
+        hi = sv[int(n * 0.8)] if n >= 5 else sv[-1]
+        if abs(hi - lo) < 1e-8:
+            lo, hi = 0.0, 100.0
     else:
         lo, hi = min(valid), max(valid)
         if abs(hi - lo) < 1e-8:
@@ -82,7 +90,7 @@ def _normalize_in_place(funds: List[Dict], key: str, invert: bool = False):
         if v == 0.0:
             f[f"{key}_norm"] = 50.0
         else:
-            score = (v - lo) / (hi - lo) * 100.0
+            score = max(0, min(100, (v - lo) / (hi - lo) * 100.0))
             f[f"{key}_norm"] = 100.0 - score if invert else score
 
 
@@ -325,12 +333,34 @@ class QuantService:
 
         return "\n".join(lines)
 
+    # ============================================================
+    # AI 深度分析单只基金（Tab 2 "单基金深度诊断"）
+    # ============================================================
 
-        # 构建基金数据摘要
-        fund_data = {
-            "fund_code": basic.fund_code,
-            "fund_name": basic.fund_name,
-            "fund_type": basic.fund_type,
+    def ai_analyze_single_fund(self, db, fund_code: str) -> Dict[str, Any]:
+        """AI 深度分析单只基金：从 DB 拉数据 → 格式化为 prompt → LLM 诊断"""
+        from models import FundBasicInfo, FundTrend, FundRiskMetrics, FundScreeningRank, FundExtraData
+
+        rows = db.query(FundBasicInfo, FundRiskMetrics, FundScreeningRank, FundExtraData, FundTrend).outerjoin(
+            FundRiskMetrics, FundBasicInfo.fund_code == FundRiskMetrics.fund_code
+        ).outerjoin(
+            FundScreeningRank, FundBasicInfo.fund_code == FundScreeningRank.fund_code
+        ).outerjoin(
+            FundExtraData, FundBasicInfo.fund_code == FundExtraData.fund_code
+        ).outerjoin(
+            FundTrend, FundBasicInfo.fund_code == FundTrend.fund_code
+        ).filter(FundBasicInfo.fund_code == fund_code).first()
+
+        if not rows:
+            return {"success": False, "error": f"未找到基金 {fund_code}"}
+
+        basic, risk, rank, extra, trend = rows
+        perf = _json_loads(basic.performance_json)
+
+        # 构建数据摘要
+        fd = {
+            "fund_code": basic.fund_code, "fund_name": basic.fund_name,
+            "fund_type": basic.fund_type or "未知",
             "returns": {
                 "1m": _safe_float(perf.get("1_month_return")),
                 "3m": _safe_float(perf.get("3_month_return")),
@@ -340,104 +370,58 @@ class QuantService:
                 "3y": _safe_float(perf.get("3_year_return")),
             },
             "risk": {
-                "sharpe_1y": _none_to(risk.sharpe_ratio_1y if risk else None, 0),
-                "sharpe_3y": _none_to(risk.sharpe_ratio_3y if risk else None, 0),
-                "calmar_1y": _none_to(risk.calmar_ratio_1y if risk else None, 0),
-                "max_drawdown_1y": _none_to(risk.max_drawdown_1y if risk else None, 0),
-                "max_drawdown_3y": _none_to(risk.max_drawdown_3y if risk else None, 0),
-                "volatility_1y": _none_to(risk.volatility_1y if risk else None, 0),
+                "sharpe": _none_to(risk.sharpe_ratio_1y if risk else None, 0),
+                "calmar": _none_to(risk.calmar_ratio_1y if risk else None, 0),
+                "max_dd": _none_to(risk.max_drawdown_1y if risk else None, 0),
+                "volatility": _none_to(risk.volatility_1y if risk else None, 0),
             },
             "rankings": {
                 "1y": _none_to(rank.rank_pct_1y if rank else None, 50),
-                "2y": _none_to(rank.rank_pct_2y if rank else None, 50),
                 "3y": _none_to(rank.rank_pct_3y if rank else None, 50),
             },
             "pass_4433": bool(rank and rank.pass_4433 == 1),
             "manager": {},
         }
 
-        # 经理数据
         mgr_json = _json_loads(extra.fund_managers_json if extra else "[]", [])
         if isinstance(mgr_json, dict):
             mgr_json = [mgr_json]
         if mgr_json:
             m = mgr_json[0]
-            fund_data["manager"] = {
-                "name": m.get("name", "未知"),
-                "experience": m.get("work_experience", "未知"),
-                "scale": m.get("managed_fund_size", "未知"),
-                "star": m.get("star_rating", "未知"),
-            }
+            fd["manager"] = {"name": m.get("name", "?"), "experience": m.get("work_experience", "?"),
+                             "scale": m.get("managed_fund_size", "?"), "star": m.get("star_rating", "?")}
 
-        # 净值趋势（最近 10 个点 + MA 信息）
         nw = _json_loads(trend.net_worth_trend_json if trend else "[]", [])
-        recent_navs = []
+        recent = []
         for item in nw[-90:]:
             nav = _safe_float(item.get("net_worth", 0)) if isinstance(item, dict) else _safe_float(item)
-            if nav > 0:
-                recent_navs.append(nav)
-        if len(recent_navs) >= 20:
-            ma20 = sum(recent_navs[-20:]) / 20
-            ma60 = sum(recent_navs[-min(60, len(recent_navs)):]) / min(60, len(recent_navs))
-            fund_data["trend_signal"] = {
-                "latest_nav": recent_navs[-1],
-                "ma20": round(ma20, 4),
-                "ma60": round(ma60, 4),
-                "above_ma20": recent_navs[-1] > ma20,
-                "above_ma60": recent_navs[-1] > ma60,
-            }
+            if nav > 0: recent.append(nav)
+        if len(recent) >= 20:
+            fd["trend"] = {"latest": recent[-1], "ma20": round(sum(recent[-20:]) / 20, 4),
+                           "ma60": round(sum(recent[-min(60, len(recent)):]) / min(60, len(recent)), 4)}
 
         if not self.ai_available:
-            return {
-                "fund_data": fund_data,
-                "llm_used": False,
-                "ai_analysis": None,
-                "message": "⚠️ 未配置 LLM API Key",
-            }
+            return {"success": True, "fund_data": fd, "llm_used": False,
+                    "ai_analysis": None, "message": "⚠️ 未配置 LLM API Key"}
 
-        # 构建 AI 提示
-        prompt = json.dumps(fund_data, ensure_ascii=False, indent=2)
-
-        system_prompt = """你是一位资深基金分析师。请基于基金数据，给出买卖建议。
-
-## 输出格式（严格 JSON）
+        prompt = json.dumps(fd, ensure_ascii=False, indent=2)
+        system = """你是资深基金分析师。基于数据分析给出买卖建议。输出 JSON：
 ```json
 {
     "action": "强烈买入/买入/持有/减仓/卖出",
     "confidence": 0-100,
     "score": 0-100,
-    "summary": "一句话总结（50字内）",
-    "bull_case": ["看涨理由1", "看涨理由2"],
-    "bear_case": ["看跌理由1", "看跌理由2"],
-    "key_metrics_analysis": {
-        "return_analysis": "收益分析（50字）",
-        "risk_analysis": "风险分析（50字）",
-        "manager_analysis": "经理分析（50字）",
-        "trend_analysis": "趋势分析（50字）"
-    },
-    "suggested_entry": {
-        "method": "一次性买入/分3批/每月定投/等回调再买/暂时不要买",
-        "reason": "为什么推荐这种买入方式",
-        "suggested_price_or_condition": "建议的买入价格或条件"
-    },
-    "suggested_exit": {
-        "stop_loss_price_or_pct": "止损价位或百分比",
-        "take_profit_price_or_pct": "止盈价位或百分比",
-        "time_stop": "最晚持有到什么时候如果还不涨就卖"
-    },
-    "risk_warnings": ["风险提示1", "风险提示2"]
+    "summary": "一句话总结",
+    "bull_case": ["看多理由"],
+    "bear_case": ["看空理由"],
+    "key_metrics_analysis": {"return": "收益分析", "risk": "风险分析", "manager": "经理分析", "trend": "趋势分析"},
+    "suggested_entry": {"method": "一次性/分3批/定投/等回调", "reason": "理由"},
+    "suggested_exit": {"stop_loss": "止损条件", "take_profit": "止盈条件"}
 }
 ```"""
-
-        llm_text = self._call_llm(system_prompt, prompt, max_tokens=2048)
-        ai_analysis = self._parse_json_from_llm(llm_text) if llm_text else None
-
-        return {
-            "fund_data": fund_data,
-            "llm_used": True,
-            "model": self._model,
-            "ai_analysis": ai_analysis,
-        }
+        llm_text = self._call_llm(system, prompt, max_tokens=2048)
+        return {"success": True, "fund_data": fd, "llm_used": True, "model": self._model,
+                "ai_analysis": self._parse_json_from_llm(llm_text) if llm_text else None}
 
     # ==================================================================
     # 内部：标准化量化打分（给 AI 提供结构化输入）
@@ -848,15 +832,26 @@ class QuantService:
         elif yellows >= 2: recommendation = "观望"
         else: recommendation = "持有"
 
-        # AI 复核
+        # AI 复核（LLM 不可用时用规则自动生成）
         ai_review = None
         if self.ai_available:
             ai_text = self._call_llm(
-                system_prompt="你是一位风控专家。请基于卖出信号综合判断是否该卖出，输出 JSON：{\"agree\": true/false, \"confidence\": 0-100, \"action\": \"立即清仓/逐步减仓/暂时持有/逢高卖出\", \"explanation\": \"你的判断理由（80字内）\"}",
-                user_prompt=f"基金: {basic.fund_name}({fund_code}), 卖出评分: {exit_score:.0f}/100, 信号: " + ", ".join(f"{s['name']}={s['level']}" for s in signals),
-                max_tokens=512,
+                system_prompt="你是风控专家。基于卖出信号判断是否该卖出。输出 JSON：{\"agree\": true/false, \"action\": \"立即清仓/逐步减仓/暂时持有/逢高卖出\", \"explanation\": \"判断理由\"}",
+                user_prompt=f"基金: {basic.fund_name}({fund_code}), 评分: {exit_score:.0f}/100, 信号: " + ", ".join(f"{s['name']}={s['level']}" for s in signals),
+                max_tokens=300,
             )
             ai_review = self._parse_json_from_llm(ai_text) if ai_text else None
+
+        # 如果 LLM 没返回，用规则生成 fallback
+        if not ai_review:
+            if reds >= 2:
+                ai_review = {"agree": True, "action": "立即清仓", "explanation": f"触发{reds}个红色卖出信号，建议立即清仓离场。"}
+            elif reds >= 1:
+                ai_review = {"agree": True, "action": "逐步减仓", "explanation": f"出现{reds}个红色信号，建议分批减仓控制风险。"}
+            elif yellows >= 2:
+                ai_review = {"agree": True, "action": "暂时持有", "explanation": f"有{yellows}个黄色预警信号，暂时持有密切观察。"}
+            else:
+                ai_review = {"agree": False, "action": "继续持有", "explanation": "各维度信号正常，暂无卖出必要。"}
 
         return {
             "fund_code": fund_code, "fund_name": basic.fund_name,
