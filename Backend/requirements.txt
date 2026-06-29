@@ -9,3 +9,4 @@ curl_cffi>=0.5.0
 lxml>=4.9.0
 langchain>=0.1.0
 langchain-openai>=0.0.5
+akshare>=1.18.0
