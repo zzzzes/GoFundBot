@@ -184,6 +184,87 @@ export default {
         })
     }
 
+    const roundTo = (value, precision = 6) => {
+        const factor = Math.pow(10, precision)
+        return Math.round(value * factor) / factor
+    }
+
+    const getDecimalPlaces = (value) => {
+        if (!isFinite(value)) return 0
+        const text = String(value)
+        if (text.includes('e-')) {
+            return Number(text.split('e-')[1])
+        }
+        return (text.split('.')[1] || '').length
+    }
+
+    const getNiceStep = (rawStep) => {
+        if (!isFinite(rawStep) || rawStep <= 0) return 1
+
+        const exponent = Math.floor(Math.log10(rawStep))
+        const magnitude = Math.pow(10, exponent)
+        const fraction = rawStep / magnitude
+
+        let niceFraction = 10
+        if (fraction <= 1) {
+            niceFraction = 1
+        } else if (fraction <= 2) {
+            niceFraction = 2
+        } else if (fraction <= 2.5) {
+            niceFraction = 2.5
+        } else if (fraction <= 5) {
+            niceFraction = 5
+        }
+
+        return roundTo(niceFraction * magnitude)
+    }
+
+    const getNiceYAxis = (values) => {
+        const numericValues = values.filter(value => typeof value === 'number' && isFinite(value))
+        if (numericValues.length === 0) return {}
+
+        let min = Math.min(...numericValues)
+        let max = Math.max(...numericValues)
+
+        if (min === max) {
+            const padding = Math.max(Math.abs(min) * 0.1, 1)
+            min -= padding
+            max += padding
+        }
+
+        const padding = Math.max((max - min) * 0.08, 0.05)
+        const paddedMin = min - padding
+        const paddedMax = max + padding
+        const interval = getNiceStep((paddedMax - paddedMin) / 6)
+        const precision = Math.max(getDecimalPlaces(interval), 0)
+
+        return {
+            min: roundTo(Math.floor(paddedMin / interval) * interval, precision),
+            max: roundTo(Math.ceil(paddedMax / interval) * interval, precision),
+            interval
+        }
+    }
+
+    const formatAxisLabel = (value, unit = '%') => {
+        const num = Number(value)
+        if (!isFinite(num)) return ''
+        const abs = Math.abs(num)
+        const decimals = abs >= 10 ? 0 : abs >= 1 ? 1 : 2
+        return `${num.toFixed(decimals).replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1')}${unit}`
+    }
+
+    const applyNiceYAxis = (option, unit = '%') => {
+        const values = (option.series || [])
+            .flatMap(series => series.data || [])
+            .map(point => Array.isArray(point) ? Number(point[1]) : Number(point))
+
+        Object.assign(option.yAxis, getNiceYAxis(values), {
+            axisLabel: {
+                formatter: value => formatAxisLabel(value, unit)
+            }
+        })
+    }
+
     const processData = () => {
         const rawData = (props.netWorthTrend || [])
             .filter(item => item && typeof item.x === 'number' && !isNaN(item.x) && typeof item.y === 'number' && !isNaN(item.y))
@@ -308,15 +389,8 @@ export default {
         yAxis: {
             type: 'value',
             scale: true,
-            min: function (value) {
-                // 保证 Y 轴至少有 ±0.1% 的可视范围，避免货币基金等低波动品种的走势被挤出图表
-                return value.min - Math.max((value.max - value.min) * 0.15, 0.05)
-            },
-            max: function (value) {
-                return value.max + Math.max((value.max - value.min) * 0.15, 0.05)
-            },
             splitLine: { lineStyle: { type: 'dashed' } },
-            axisLabel: { formatter: '{value}%' }
+            axisLabel: { formatter: value => formatAxisLabel(value, '%') }
         },
         series: []
       }
@@ -339,12 +413,13 @@ export default {
               }
           })
 
-          option.yAxis.axisLabel.formatter = useRawValues ? '{value}' : '{value}%'
+          applyNiceYAxis(option, useRawValues ? '' : '%')
 
           option.tooltip.formatter = function (params) {
               let res = '<div>' + echarts.format.formatTime('yyyy-MM-dd', params[0].value[0]) + '</div>'
               params.forEach(item => {
-                  res += `<div>${item.marker} ${item.seriesName}: ${item.value[1]}${unit}</div>`
+                  const val = Number(item.value[1])
+                  res += `<div>${item.marker} ${item.seriesName}: ${isFinite(val) ? val.toFixed(useRawValues ? 4 : 2) : item.value[1]}${unit}</div>`
               })
               return res;
           }
@@ -382,14 +457,16 @@ export default {
               
               option.series = series
               option.legend = { show: false } // Hide internal legend
+              applyNiceYAxis(option, '%')
               
               // Adjust tooltip for comparison to show %
               option.tooltip.formatter = function (params) {
                   let res = '<div>' + echarts.format.formatTime('yyyy-MM-dd', params[0].value[0]) + '</div>'
                   params.forEach(item => {
+                      const val = Number(item.value[1])
                       res += `<div>
                         <span style="display:inline-block;margin-right:5px;border-radius:50%;width:10px;height:10px;background-color:${item.color};"></span>
-                        ${item.seriesName}: ${item.value[1]}%
+                        ${item.seriesName}: ${isFinite(val) ? val.toFixed(2) : item.value[1]}%
                       </div>`
                   })
                   return res;
@@ -465,6 +542,7 @@ export default {
                   seriesData.markPoint.data = points;
               }
               option.series.push(seriesData)
+              applyNiceYAxis(option, '%')
           }
       }
 

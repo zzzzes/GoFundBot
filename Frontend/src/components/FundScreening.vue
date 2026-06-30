@@ -309,18 +309,22 @@
                   <span>{{ item.text }}</span>
                 </label>
                 <div class="adv-range" v-else-if="item.type === 'range'">
-                  <input v-model.number="advFilters[item.minKey]" type="number" placeholder="最小值" step="any" class="adv-inp" />
+                  <input v-model.number="advFilters[item.minKey]" type="number" placeholder="最小值" step="any" class="adv-inp" @keyup.enter="search(true)" />
                   <span class="adv-sep">~</span>
-                  <input v-model.number="advFilters[item.maxKey]" type="number" placeholder="最大值" step="any" class="adv-inp" />
+                  <input v-model.number="advFilters[item.maxKey]" type="number" placeholder="最大值" step="any" class="adv-inp" @keyup.enter="search(true)" />
                   <span class="adv-unit" v-if="item.unit">{{ item.unit }}</span>
                 </div>
                 <div class="adv-range" v-else>
                   <span class="adv-op">{{ item.operator }}</span>
-                  <input v-model.number="advFilters[item.key]" type="number" :placeholder="item.placeholder || ''" step="any" class="adv-inp" />
+                  <input v-model.number="advFilters[item.key]" type="number" :placeholder="item.placeholder || ''" step="any" class="adv-inp" @keyup.enter="search(true)" />
                   <span class="adv-unit" v-if="item.unit">{{ item.unit }}</span>
                 </div>
               </div>
             </div>
+          </div>
+          <div class="adv-actions">
+            <button class="btn-reset-adv" @click="resetAdvFilters">清空高级条件</button>
+            <button class="btn-apply-adv" @click="search(true)">应用筛选</button>
           </div>
         </div>
       </div>
@@ -1173,6 +1177,13 @@ export default {
       quickTypeFilter.value = ''
     }
 
+    // 仅重置高级筛选条件
+    const resetAdvFilters = () => {
+      Object.keys(advFilters).forEach(k => {
+        advFilters[k] = typeof advFilters[k] === 'boolean' ? false : null
+      })
+    }
+
     const fetchIndustryTags = async () => {
       try {
         const res = await screeningAPI.getIndustryTags()
@@ -1480,6 +1491,7 @@ export default {
       startUpdate,
       stopUpdate,
       resetFilters,
+      resetAdvFilters,
       search,
       changePage,
       onPageSizeChange,
@@ -2788,6 +2800,50 @@ export default {
   font-size: 12px;
   color: #999;
   flex-shrink: 0;
+}
+
+/* 高级筛选操作按钮 */
+.adv-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid #eef2f7;
+}
+
+.btn-reset-adv {
+  padding: 8px 16px;
+  background: #fff;
+  color: #6b7280;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-reset-adv:hover {
+  border-color: #1677ff;
+  color: #1677ff;
+  background: #f0f5ff;
+}
+
+.btn-apply-adv {
+  padding: 8px 20px;
+  background: #1677ff;
+  color: #fff;
+  border: 1px solid #1677ff;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-apply-adv:hover {
+  background: #0958d9;
 }
 
 /* ── 自定义类型下拉 ── */

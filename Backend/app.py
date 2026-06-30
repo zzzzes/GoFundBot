@@ -13,6 +13,7 @@ from data_service_routes import data_service_bp
 from services.data_service_client import DataServiceClient, DataServiceError, get_data_service_client
 from services.data_service_legacy_mapper import map_data_service_detail_to_legacy
 from quant_service import get_quant_service, BacktestAdvancedParams, PositionParams
+from services.backtest_engine import run_strategy_backtest
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, asc, and_, or_, func, cast, Float
 from datetime import datetime, timedelta
@@ -5776,6 +5777,132 @@ def get_data_stats():
 
 # ==================== 基金回测功能 ====================
 
+def _extract_nav_points_from_payload(payload):
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get('data', payload)
+    if isinstance(data, dict):
+        if isinstance(data.get('items'), list):
+            return data.get('items')
+        if isinstance(data.get('navHistory'), dict):
+            nav_data = data['navHistory'].get('data')
+            if isinstance(nav_data, dict) and isinstance(nav_data.get('items'), list):
+                return nav_data.get('items')
+            if isinstance(nav_data, list):
+                return nav_data
+    return []
+
+
+def _load_backtest_nav_points(db, fund_code, start_date, end_date):
+    trend = db.query(FundTrend).filter(FundTrend.fund_code == fund_code).first()
+    nav_points = []
+    if trend:
+        raw_points = _json_loads(trend.net_worth_trend_json, [])
+        for item in raw_points:
+            date_str = str(item.get('date') or '').split(' ')[0]
+            nav = item.get('net_worth')
+            if date_str and start_date <= date_str <= end_date:
+                nav_points.append({'date': date_str, 'net_worth': nav})
+
+    if len(nav_points) >= 2:
+        return nav_points
+
+    try:
+        payload = get_data_service_client().get_fund_nav_history(
+            fund_code,
+            start_date=start_date.replace('-', ''),
+            end_date=end_date.replace('-', ''),
+        )
+        items = _extract_nav_points_from_payload(payload)
+        nav_points = []
+        for item in items:
+            date_str = str(item.get('date') or item.get('navDate') or '').split(' ')[0]
+            if len(date_str) == 8 and date_str.isdigit():
+                date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+            nav = item.get('nav')
+            if nav is None:
+                nav = item.get('net_worth')
+            if date_str and start_date <= date_str <= end_date:
+                nav_points.append({'date': date_str, 'nav': nav})
+        return nav_points
+    except Exception as exc:
+        print(f"backtest nav fallback unavailable for {fund_code}: {exc}", flush=True)
+        return nav_points
+
+
+def _safe_float_param(data, key, default):
+    value = data.get(key)
+    if value is None or value == '':
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _execute_strategy_backtest(data):
+    fund_code = str(data.get('fund_code') or '').strip()
+    start_date = str(data.get('start_date') or '').strip()
+    end_date = str(data.get('end_date') or '').strip()
+    strategy_type = data.get('strategy_type') or 'fixed_amount'
+    params = data.get('params') if isinstance(data.get('params'), dict) else {}
+
+    if not all([fund_code, start_date, end_date]):
+        return jsonify({'error': 'Missing required parameters'}), 400
+
+    try:
+        datetime.strptime(start_date, '%Y-%m-%d')
+        datetime.strptime(end_date, '%Y-%m-%d')
+    except ValueError:
+        return jsonify({'error': 'Invalid date format, expected YYYY-MM-DD'}), 400
+
+    capital = _safe_float_param(data, 'capital', 10000)
+    fee_rate = _safe_float_param(data, 'fee_rate', 0.15) / 100
+    if capital <= 0:
+        return jsonify({'error': 'capital must be greater than 0'}), 400
+
+    db = get_db()
+    nav_points = _load_backtest_nav_points(db, fund_code, start_date, end_date)
+    if len(nav_points) < 2:
+        return jsonify({'error': f'Insufficient data in range {start_date} to {end_date}. Found {len(nav_points)} records.'}), 400
+
+    result = run_strategy_backtest(
+        nav_points=nav_points,
+        strategy_type=strategy_type,
+        capital=capital,
+        fee_rate=fee_rate,
+        params=params,
+    )
+    if 'error' in result:
+        return jsonify(result), 400
+    return jsonify(result)
+
+
+@app.route('/api/backtest/strategy', methods=['POST'])
+def backtest_strategy():
+    return _execute_strategy_backtest(request.get_json() or {})
+
+
+def _execute_legacy_fixed_investment(data):
+    investment_type = data.get('investment_type', 'monthly')
+    payload = {
+        'fund_code': data.get('fund_code'),
+        'start_date': data.get('start_date'),
+        'end_date': data.get('end_date'),
+        'strategy_type': 'fixed_amount',
+        'capital': _safe_float_param(data, 'capital', _safe_float_param(data, 'total_capital', 10000)),
+        'fee_rate': _safe_float_param(data, 'fee_rate', 0.15),
+        'params': {
+            'frequency': investment_type,
+            'investment_type': investment_type,
+            'investment_day': data.get('investment_day'),
+            'amount': _safe_float_param(data, 'amount', 1000),
+            'initial_amount': _safe_float_param(data, 'initial_amount', 0),
+        }
+    }
+    return _execute_strategy_backtest(payload)
+
+
 @app.route('/api/backtest/fixed-investment', methods=['POST'])
 def backtest_fixed_investment():
     """
@@ -5794,7 +5921,8 @@ def backtest_fixed_investment():
         "stop_loss_rate": 10 // 止损率（百分比，可选，正数）
     }
     """
-    data = request.get_json()
+    data = request.get_json() or {}
+    return _execute_legacy_fixed_investment(data)
     
     try:
         fund_code = data.get('fund_code')
@@ -6109,16 +6237,19 @@ def _run_backtest(nav_dict, dates, investment_type, amount, initial_amount, fee_
 # Research dashboard
 # ---------------------------------------------------------------------------
 
+# P0: 移除了 ETF 分组（数据库中无 fund_type 含"ETF"的分类，ETF 归入指数型）
+# P0: 货币型标记为 unavailable，因为 pingzhongdata API 不支持货币基金的百分比收益率
 RESEARCH_FUND_GROUPS = [
     {"key": "equity", "name": "股票型", "keywords": ["股票"]},
     {"key": "hybrid", "name": "混合型", "keywords": ["混合"]},
     {"key": "bond", "name": "债券型", "keywords": ["债券", "债券型"]},
     {"key": "index", "name": "指数型", "keywords": ["指数", "联接"]},
-    {"key": "etf", "name": "ETF", "keywords": ["ETF", "交易型开放式指数"]},
     {"key": "qdii", "name": "QDII", "keywords": ["QDII"]},
     {"key": "fof", "name": "FOF", "keywords": ["FOF"]},
-    {"key": "money", "name": "货币型", "keywords": ["货币"]},
+    {"key": "money", "name": "货币型（暂不支持）", "keywords": ["货币"]},
 ]
+
+UNAVAILABLE_FUND_GROUPS = {"money"}  # 数据源不支持的分组
 
 
 def _to_float(value):
@@ -6154,6 +6285,11 @@ def _avg(values):
 def _positive_rate(values):
     nums = [v for v in (_to_float(item) for item in values) if v is not None]
     return round(sum(1 for v in nums if v > 0) / len(nums) * 100, 2) if nums else None
+
+
+def _sum(values):
+    nums = [v for v in (_to_float(item) for item in values) if v is not None]
+    return round(sum(nums), 2) if nums else None
 
 
 def _fund_type_matches(fund_type, fund_name, keywords):
@@ -6216,10 +6352,21 @@ def _build_research_market_stats(db):
     rank_ready = sum(1 for _, _, rank, _ in rows if rank)
     pass_4433 = sum(1 for _, _, rank, _ in rows if rank and rank.pass_4433 == 1)
 
+    # P2: QDII 子类型合并为 "QDII"，避免碎片化
+    def _consolidate_type(fund_type):
+        ft = fund_type or "未分类"
+        if ft.startswith("QDII"):
+            return "QDII"
+        return ft
+
     type_map = {}
     group_map = {}
-    for item in items:
-        fund_type = item.get("fund_type") or "未分类"
+    all_sharpe_values = []
+    all_volatility_values = []
+    all_drawdown_values = []
+    all_return_3y_values = []
+    for item, (_, risk, _, _) in zip(items, rows):
+        fund_type = _consolidate_type(item.get("fund_type"))
         type_stat = type_map.setdefault(fund_type, {
             "fund_type": fund_type,
             "count": 0,
@@ -6242,6 +6389,12 @@ def _build_research_market_stats(db):
         group_stat["count"] += 1
         group_stat["return_1y_values"].append(item.get("return_1y"))
 
+        if risk:
+            all_sharpe_values.append(risk.sharpe_ratio_1y)
+            all_volatility_values.append(risk.volatility_1y)
+            all_drawdown_values.append(risk.max_drawdown_1y)
+        all_return_3y_values.append(item.get("return_3y"))
+
     type_stats = []
     for stat in type_map.values():
         type_stats.append({
@@ -6263,6 +6416,7 @@ def _build_research_market_stats(db):
             "count": stat["count"],
             "ratio": round(stat["count"] / total * 100, 2) if total else 0,
             "return_1y_median": _median(stat["return_1y_values"]),
+            "available": stat["key"] not in UNAVAILABLE_FUND_GROUPS,
         })
     group_stats.sort(key=lambda item: item["count"], reverse=True)
 
@@ -6271,9 +6425,15 @@ def _build_research_market_stats(db):
         default=None,
     )
 
+    # P2: 市场覆盖率（相对于天天基金全量列表）
+    market_total = 27038  # 天天基金 fundcode_search.js 全量
+    coverage_rate = round(total / market_total * 100, 2) if market_total else None
+
     return {
         "summary": {
             "total_funds": total,
+            "market_total": market_total,
+            "coverage_rate": coverage_rate,
             "risk_ready": risk_ready,
             "risk_ready_rate": round(risk_ready / total * 100, 2) if total else 0,
             "rank_ready": rank_ready,
@@ -6282,6 +6442,10 @@ def _build_research_market_stats(db):
             "pass_4433_rate": round(pass_4433 / total * 100, 2) if total else 0,
             "return_1y_median": _median(item.get("return_1y") for item in items),
             "return_3m_median": _median(item.get("return_3m") for item in items),
+            "return_3y_median": _median(all_return_3y_values),
+            "sharpe_1y_median": _median(all_sharpe_values),
+            "volatility_1y_median": _median(all_volatility_values),
+            "max_drawdown_1y_median": _median(all_drawdown_values),
             "positive_1y_rate": _positive_rate(item.get("return_1y") for item in items),
             "latest_update": latest_update.isoformat() if latest_update else None,
         },
@@ -6326,6 +6490,7 @@ def _build_research_fund_dashboard(db, limit=5):
         cards.append({
             "key": group["key"],
             "name": group["name"],
+            "available": group["key"] not in UNAVAILABLE_FUND_GROUPS,
             "summary": {
                 "total": len(items),
                 "pass_4433": sum(1 for item in items if item.get("pass_4433")),
@@ -6337,6 +6502,92 @@ def _build_research_fund_dashboard(db, limit=5):
 
     cards.sort(key=lambda card: card["summary"]["total"], reverse=True)
     return {"cards": cards, "limit": limit}
+
+
+# ── ETF 基金池：从天天基金排行榜 API 批量拉取 ETF 业绩数据 ──
+
+_etf_performance_cache = {}     # fund_code -> {name, return_1m, return_3m, return_6m, return_1y, return_3y, ...}
+_etf_performance_cache_time = None
+
+
+def _fetch_etf_performance_from_ranking(max_pages=40):
+    """从天天基金排行榜 API 拉取指数型基金，过滤 ETF，缓存业绩数据。
+
+    数据源: fund.eastmoney.com/data/rankhandler.aspx?ft=zs
+    返回 ~2,400 只 ETF（来自 4,357 只指数基金，~55% 含"ETF"名称）。
+    每页 50 条，40 页 = 2,000 只指数基金 → ~1,100 只 ETF。
+    """
+    global _etf_performance_cache, _etf_performance_cache_time
+    now = datetime.now()
+    # 缓存 2 小时（业绩数据一天才变一次）
+    if _etf_performance_cache_time and (now - _etf_performance_cache_time).seconds < 7200:
+        return _etf_performance_cache
+
+    new_cache = {}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://fund.eastmoney.com/data/fundranking.html',
+    }
+    total_etfs = 0
+
+    for page in range(1, max_pages + 1):
+        params = {
+            'op': 'ph', 'dt': 'kf', 'ft': 'zs',
+            'rs': '', 'gs': 0, 'sc': '1nzf', 'st': 'desc',
+            'sd': '', 'ed': '', 'qdii': '',
+            'tabSubtype': ',,,,,',
+            'pi': str(page), 'pn': '50', 'dx': '1',
+        }
+        try:
+            resp = requests.get(
+                'https://fund.eastmoney.com/data/rankhandler.aspx',
+                params=params, headers=headers, timeout=12,
+            )
+            resp.raise_for_status()
+            match = re.search(r'var rankData\s*=\s*(\{.*?\});', resp.text, re.DOTALL)
+            if not match:
+                break
+            json_str = re.sub(r'(\w+):', r'"\1":', match.group(1))
+            payload = json.loads(json_str)
+            rows = payload.get('datas', [])
+            if not rows:
+                break
+
+            for item in rows:
+                parts = item.split(',')
+                if len(parts) < 17:
+                    continue
+                code = _normalize_fund_code(parts[0])
+                name = parts[1]
+                if not code or 'ETF' not in name:
+                    continue
+                new_cache[code] = {
+                    'fund_code': code,
+                    'fund_name': name,
+                    'fund_type': 'ETF',
+                    'nav': _to_float(parts[4]),
+                    'daily_change': _to_float(parts[6]),
+                    'return_1w': _to_float(parts[7]),
+                    'return_1m': _to_float(parts[8]),
+                    'return_3m': _to_float(parts[9]),
+                    'return_6m': _to_float(parts[10]),
+                    'return_1y': _to_float(parts[11]),
+                    'return_2y': _to_float(parts[12]),
+                    'return_3y': _to_float(parts[13]),
+                    'return_ytd': _to_float(parts[14]),
+                    'return_since_inception': _to_float(parts[15]),
+                }
+
+            time.sleep(0.25)  # 礼貌间隔
+        except Exception as exc:
+            print(f'ETF ranking fetch page {page} failed: {exc}', flush=True)
+            break
+
+    total_etfs = len(new_cache)
+    print(f'ETF ranking: fetched {total_etfs} ETFs from {page} pages', flush=True)
+    _etf_performance_cache = new_cache
+    _etf_performance_cache_time = now
+    return new_cache
 
 
 def _row_value(row, index, *names):
@@ -6489,36 +6740,63 @@ def _build_etf_tracking_from_cache(limit=80):
             'with_estimate': 0,
             'avg_estimate_change': None,
             'positive_estimate_rate': None,
+            'total_amount': None,
             'net_flow_available': False,
             'source': 'fund_list_cache',
             'stale': True,
-            'net_flow_note': '已从本地基金列表识别 ETF 池；实时行情需要刷新 AkShare/东方财富快照后显示。',
+            'net_flow_note': '已从本地基金列表识别 ETF 池；实时行情需要点击刷新获取东方财富快照。',
         },
     }
 
 
 def _build_etf_tracking_snapshot(db, limit=80, refresh=False):
     source_error = None
-    if refresh or db.query(FundEtfTracking).count() == 0:
+    # P1: 检查数据是否需要刷新（无数据 或 最后更新不是今天）
+    existing_count = db.query(FundEtfTracking).count()
+    should_refresh = refresh or existing_count == 0
+    if not should_refresh and existing_count > 0:
+        latest = db.query(FundEtfTracking.updated_time).order_by(
+            desc(FundEtfTracking.updated_time)
+        ).first()
+        if latest and latest[0]:
+            latest_date = latest[0].date() if hasattr(latest[0], 'date') else latest[0]
+            if isinstance(latest_date, datetime):
+                latest_date = latest_date.date()
+            today = datetime.now().date()
+            if latest_date < today:
+                should_refresh = True
+    if should_refresh:
         try:
-            _refresh_etf_tracking_from_akshare(db, limit=max(limit, 300))
+            _refresh_etf_tracking_from_akshare(db, limit=800)
             db.commit()
         except Exception as exc:
             db.rollback()
             source_error = str(exc)
             print(f"ETF tracking: akshare unavailable: {exc}", flush=True)
 
+    # P1: 从排行榜 API 拉取 ETF 业绩数据（~1,100 只 ETF，含近1月/3月/6月/1年/3年收益）
+    perf_data = {}
+    perf_source = None
+    try:
+        perf_data = _fetch_etf_performance_from_ranking(max_pages=40)
+        perf_source = 'eastmoney.ranking'
+    except Exception as perf_exc:
+        print(f'ETF performance fetch failed: {perf_exc}', flush=True)
+
     rows = db.query(FundEtfTracking).order_by(
         desc(FundEtfTracking.change_percent)
-    ).limit(limit).all()
-    if not rows:
+    ).all()  # 取全部（通常 ~100-800 只），便于合并和统计
+
+    # 如果没有实时行情也没有业绩数据，回退到 fund_list_cache
+    if not rows and not perf_data:
         payload = _build_etf_tracking_from_cache(limit=limit)
         payload['summary']['source_error'] = source_error
         return payload
 
-    items = []
-    for row in rows:
-        items.append({
+    # 构建 live items，按 code 索引
+    live_items = {}
+    for row in (rows or []):
+        live_items[row.fund_code] = {
             'fund_code': row.fund_code,
             'fund_name': row.fund_name,
             'fund_type': 'ETF',
@@ -6533,14 +6811,77 @@ def _build_etf_tracking_snapshot(db, limit=80, refresh=False):
             'turnover_rate': row.turnover_rate,
             'fund_share': row.fund_share,
             'market_value': row.market_value,
-            'return_1y': None,
             'nav_date': row.trade_time.date().isoformat() if row.trade_time else None,
             'updated_time': row.updated_time.isoformat() if row.updated_time else None,
-            'source': row.source,
-        })
+            'source': row.source or 'eastmoney.push2',
+            '_has_live': True,
+        }
 
+    # 合并：按 code 去重，live+perf 双有 ＞ live only ＞ perf only
+    matched = []   # live + perf
+    live_only = []
+    perf_only = []
+
+    for code in set(list(live_items.keys()) + list(perf_data.keys())):
+        live = live_items.get(code, {})
+        perf = perf_data.get(code, {})
+        if not live and not perf:
+            continue
+        base = {
+            'fund_code': code,
+            'fund_name': live.get('fund_name') or perf.get('fund_name') or '',
+            'fund_type': 'ETF',
+            'estimate_change': live.get('estimate_change') or perf.get('daily_change'),
+            'latest_price': live.get('latest_price'),
+            'iopv': live.get('iopv'),
+            'discount_rate': live.get('discount_rate'),
+            'change_percent': live.get('change_percent'),
+            'change_amount': live.get('change_amount'),
+            'volume': live.get('volume'),
+            'amount': live.get('amount'),
+            'turnover_rate': live.get('turnover_rate'),
+            'fund_share': live.get('fund_share'),
+            'market_value': live.get('market_value'),
+            'return_1m': perf.get('return_1m'),
+            'return_3m': perf.get('return_3m'),
+            'return_6m': perf.get('return_6m'),
+            'return_1y': perf.get('return_1y'),
+            'return_3y': perf.get('return_3y'),
+            'return_ytd': perf.get('return_ytd'),
+            'daily_change': perf.get('daily_change'),
+            'nav_date': live.get('nav_date'),
+            'updated_time': live.get('updated_time'),
+            'source': live.get('source') or 'eastmoney.ranking',
+            '_has_live': bool(live),
+            '_has_perf': bool(perf),
+        }
+        if live and perf:
+            matched.append(base)
+        elif live:
+            live_only.append(base)
+        else:
+            perf_only.append(base)
+
+    # 排序：live 按涨跌幅降序，perf 按 1年收益降序
+    live_only.sort(key=lambda it: -(it.get('estimate_change') or -999))
+    perf_only.sort(key=lambda it: -(it.get('return_1y') or -999))
+    matched.sort(key=lambda it: (
+        -(it.get('estimate_change') or -999),
+        -(it.get('return_1y') or -999),
+    ))
+
+    # 展示：交替取 live 和 perf，优先展示 matched + 混合
+    half = max(limit // 2, 10)
+    live_display = matched + live_only
+    perf_display = matched + perf_only
+    displayed = (live_display[:half] + perf_display[:half])[:limit]
+
+    # 全量池（用于分类统计）
+    all_items = matched + live_only + perf_only
+
+    # 分类统计（基于全量池）
     categories = {}
-    for item in items:
+    for item in all_items:
         name = item.get('fund_name') or ''
         if any(word in name for word in ['债', '货币']):
             category = '债券/货币 ETF'
@@ -6552,36 +6893,53 @@ def _build_etf_tracking_snapshot(db, limit=80, refresh=False):
             category = '行业主题 ETF'
         else:
             category = '宽基/普通指数 ETF'
-        stat = categories.setdefault(category, {'category': category, 'count': 0, 'estimate_values': []})
+        stat = categories.setdefault(category, {
+            'category': category,
+            'count': 0,
+            'estimate_values': [],
+            'return_1y_values': [],
+            'amount_values': [],
+            'volume_values': [],
+        })
         stat['count'] += 1
         stat['estimate_values'].append(item.get('estimate_change'))
+        stat['return_1y_values'].append(item.get('return_1y'))
+        stat['amount_values'].append(item.get('amount'))
+        stat['volume_values'].append(item.get('volume'))
 
     category_items = [
         {
             'category': stat['category'],
             'count': stat['count'],
             'estimate_change_avg': _avg(stat['estimate_values']),
-            'return_1y_median': None,
+            'return_1y_median': _median(stat['return_1y_values']),
+            'amount_total': _sum(stat['amount_values']),
             'net_flow': None,
         }
         for stat in categories.values()
     ]
     category_items.sort(key=lambda item: item['count'], reverse=True)
 
-    latest_update = max((item.get('updated_time') for item in items if item.get('updated_time')), default=None)
+    latest_update = max((item.get('updated_time') for item in all_items if item.get('updated_time')), default=None)
+    total_amount = _sum(item.get('amount') for item in all_items)
+    live_total = len(live_items)
+    perf_total = len(perf_data)
     return {
-        'items': items,
+        'items': displayed,
         'categories': category_items,
         'summary': {
-            'total': db.query(FundEtfTracking).count(),
-            'with_estimate': sum(1 for item in items if item.get('estimate_change') is not None),
-            'avg_estimate_change': _avg(item.get('estimate_change') for item in items),
-            'positive_estimate_rate': _positive_rate(item.get('estimate_change') for item in items),
+            'total': len(all_items),
+            'with_estimate': len(live_items),
+            'with_performance': len(perf_data),
+            'avg_estimate_change': _avg(item.get('estimate_change') for item in live_items.values()),
+            'positive_estimate_rate': _positive_rate(item.get('estimate_change') for item in live_items.values()),
+            'return_1y_median': _median(item.get('return_1y') for item in perf_data.values()),
+            'total_amount': total_amount,
             'net_flow_available': False,
-            'source': 'funds.db:fund_etf_tracking',
+            'source': perf_source or 'funds.db:fund_etf_tracking',
             'source_error': source_error,
             'latest_update': latest_update,
-            'net_flow_note': 'ETF 实时行情来自 AkShare/东方财富免费源；资金净流入暂未接入，当前展示涨跌、成交、IOPV 和份额快照。',
+            'net_flow_note': f'ETF 池 {perf_total} 只（来自天天基金排行榜），实时行情 {live_total} 只（来自东方财富）。',
         },
     }
 
@@ -6643,8 +7001,10 @@ def _build_research_etf_tracking(db, limit=80):
             "with_estimate": sum(1 for item in etf_items if item.get("estimate_change") is not None),
             "avg_estimate_change": _avg(item.get("estimate_change") for item in etf_items),
             "positive_estimate_rate": _positive_rate(item.get("estimate_change") for item in etf_items),
+            "total_amount": None,
             "net_flow_available": False,
-            "net_flow_note": "当前数据源尚未接入 ETF 日/周/月资金净流入，第一版展示估值、净值和收益跟踪。",
+            "stale": True,
+            "net_flow_note": "当前展示的是基金基础信息中匹配的指数型基金，不含实时行情。点击刷新获取 ETF 实时数据。",
         },
     }
 

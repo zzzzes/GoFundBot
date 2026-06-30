@@ -31,13 +31,9 @@
       <section v-show="activeTab === 'market'" class="tab-section">
         <div class="metric-grid">
           <div class="metric-card">
-            <span class="metric-label">基金总数</span>
+            <span class="metric-label">基金总数 / 覆盖率</span>
             <strong>{{ summary.total_funds || 0 }}</strong>
-          </div>
-          <div class="metric-card">
-            <span class="metric-label">风险指标覆盖</span>
-            <strong>{{ formatPercent(summary.risk_ready_rate) }}</strong>
-            <small>{{ summary.risk_ready || 0 }} 只</small>
+            <small>覆盖 {{ summary.market_total?.toLocaleString() || '--' }} 只 · {{ formatPercent(summary.coverage_rate) }}</small>
           </div>
           <div class="metric-card">
             <span class="metric-label">4433 通过率</span>
@@ -59,6 +55,20 @@
             <strong :class="returnClass(summary.return_3m_median)">
               {{ formatPercent(summary.return_3m_median) }}
             </strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">近 3 年收益中位数</span>
+            <strong :class="returnClass(summary.return_3y_median)">
+              {{ formatPercent(summary.return_3y_median) }}
+            </strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">夏普比率中位数</span>
+            <strong>{{ formatNumber(summary.sharpe_1y_median) }}</strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">最大回撤中位数</span>
+            <strong class="down">{{ formatPercent(summary.max_drawdown_1y_median) }}</strong>
           </div>
         </div>
 
@@ -90,9 +100,12 @@
           <div class="panel">
             <div class="panel-title">投研分组概览</div>
             <div class="group-list">
-              <div v-for="item in groupStats" :key="item.key" class="group-row">
+              <div v-for="item in groupStats" :key="item.key" class="group-row" :class="{ dimmed: item.available === false }">
                 <div>
-                  <strong>{{ item.name }}</strong>
+                  <strong>
+                    {{ item.name }}
+                    <span v-if="item.available === false" class="unavailable-tag">数据不全</span>
+                  </strong>
                   <span>{{ item.count }} 只</span>
                 </div>
                 <div class="bar">
@@ -109,10 +122,13 @@
 
       <section v-show="activeTab === 'funds'" class="tab-section">
         <div class="card-grid">
-          <div v-for="card in fundCards" :key="card.key" class="fund-card">
+          <div v-for="card in fundCards" :key="card.key" class="fund-card" :class="{ unavailable: card.available === false }">
             <div class="fund-card-head">
               <div>
-                <h3>{{ card.name }}</h3>
+                <h3>
+                  {{ card.name }}
+                  <span v-if="card.available === false" class="unavailable-tag">数据不全</span>
+                </h3>
                 <p>{{ card.summary.total }} 只，4433 通过 {{ card.summary.pass_4433 }} 只</p>
               </div>
               <span :class="returnClass(card.summary.return_1y_avg)">
@@ -126,6 +142,7 @@
                   <th>1年</th>
                   <th>夏普</th>
                   <th>回撤</th>
+                  <th>波动率</th>
                 </tr>
               </thead>
               <tbody>
@@ -137,6 +154,7 @@
                   <td :class="returnClass(fund.return_1y)">{{ formatPercent(fund.return_1y) }}</td>
                   <td>{{ formatNumber(fund.sharpe_ratio_1y) }}</td>
                   <td class="down">{{ formatPercent(fund.max_drawdown_1y) }}</td>
+                  <td>{{ formatPercent(fund.volatility_1y) }}</td>
                 </tr>
               </tbody>
             </table>
@@ -145,27 +163,38 @@
       </section>
 
       <section v-show="activeTab === 'etf'" class="tab-section">
-        <div class="notice" v-if="etfSummary.net_flow_available === false">
-          {{ etfSummary.net_flow_note }}
+        <div class="notice" v-if="etfSummary.source === 'fund_list_cache' || etfSummary.stale">
+          {{ etfSummary.net_flow_note || '当前为本地缓存数据，点击刷新获取实时 ETF 行情。' }}
         </div>
         <div class="metric-grid etf-metrics">
           <div class="metric-card">
-            <span class="metric-label">ETF/指数池</span>
+            <span class="metric-label">ETF 池</span>
             <strong>{{ etfSummary.total || 0 }}</strong>
+            <small v-if="etfSummary.with_performance">含业绩 {{ etfSummary.with_performance }} 只</small>
           </div>
           <div class="metric-card">
-            <span class="metric-label">有估值数据</span>
+            <span class="metric-label">实时行情</span>
             <strong>{{ etfSummary.with_estimate || 0 }}</strong>
           </div>
           <div class="metric-card">
-            <span class="metric-label">平均估值涨跌</span>
+            <span class="metric-label">平均涨跌幅</span>
             <strong :class="returnClass(etfSummary.avg_estimate_change)">
               {{ formatPercent(etfSummary.avg_estimate_change) }}
             </strong>
           </div>
           <div class="metric-card">
-            <span class="metric-label">估值上涨占比</span>
+            <span class="metric-label">1年收益中位</span>
+            <strong :class="returnClass(etfSummary.return_1y_median)">
+              {{ formatPercent(etfSummary.return_1y_median) }}
+            </strong>
+          </div>
+          <div class="metric-card">
+            <span class="metric-label">上涨占比</span>
             <strong>{{ formatPercent(etfSummary.positive_estimate_rate) }}</strong>
+          </div>
+          <div class="metric-card" v-if="etfSummary.total_amount">
+            <span class="metric-label">总成交额</span>
+            <strong>{{ formatAmountYi(etfSummary.total_amount) }}</strong>
           </div>
         </div>
 
@@ -177,9 +206,9 @@
                 <tr>
                   <th>分类</th>
                   <th>数量</th>
-                  <th>估值均值</th>
+                  <th>涨跌均值</th>
                   <th>1年中位</th>
-                  <th>资金流</th>
+                  <th>总成交额</th>
                 </tr>
               </thead>
               <tbody>
@@ -192,21 +221,22 @@
                   <td :class="returnClass(item.return_1y_median)">
                     {{ formatPercent(item.return_1y_median) }}
                   </td>
-                  <td>待接入</td>
+                  <td>{{ formatAmountYi(item.amount_total) || '--' }}</td>
                 </tr>
               </tbody>
             </table>
           </div>
 
           <div class="panel">
-            <div class="panel-title">ETF 每日跟踪</div>
+            <div class="panel-title">ETF 每日跟踪（按涨跌幅排序）</div>
             <table class="data-table">
               <thead>
                 <tr>
                   <th>基金</th>
-                  <th>估值</th>
-                  <th>1年</th>
-                  <th>净值日</th>
+                  <th>最新价</th>
+                  <th>涨跌幅</th>
+                  <th>1年收益</th>
+                  <th>成交额</th>
                 </tr>
               </thead>
               <tbody>
@@ -215,9 +245,10 @@
                     <strong :title="fund.fund_name">{{ fund.fund_name }}</strong>
                     <span>{{ fund.fund_code }}</span>
                   </td>
+                  <td>{{ formatNumber(fund.latest_price) }}</td>
                   <td :class="returnClass(fund.estimate_change)">{{ formatPercent(fund.estimate_change) }}</td>
                   <td :class="returnClass(fund.return_1y)">{{ formatPercent(fund.return_1y) }}</td>
-                  <td>{{ fund.nav_date || '--' }}</td>
+                  <td>{{ formatAmountYi(fund.amount) }}</td>
                 </tr>
               </tbody>
             </table>
@@ -304,7 +335,7 @@
                   <th>半年</th>
                   <th>1年</th>
                   <th>3年</th>
-                  <th>3月上涨</th>
+                  <th>3月上涨基金占比</th>
                 </tr>
               </thead>
               <tbody>
@@ -688,7 +719,7 @@ export default {
 
 .compact-table th:first-child,
 .compact-table td:first-child {
-  width: 42%;
+  width: 34%;
 }
 
 .compact-table th:not(:first-child),
@@ -698,17 +729,22 @@ export default {
 
 .compact-table th:nth-child(2),
 .compact-table td:nth-child(2) {
-  width: 24%;
+  width: 20%;
 }
 
 .compact-table th:nth-child(3),
 .compact-table td:nth-child(3) {
-  width: 14%;
+  width: 12%;
 }
 
 .compact-table th:nth-child(4),
 .compact-table td:nth-child(4) {
-  width: 20%;
+  width: 18%;
+}
+
+.compact-table th:nth-child(5),
+.compact-table td:nth-child(5) {
+  width: 16%;
 }
 
 .data-table th,
@@ -794,6 +830,10 @@ export default {
   border-bottom: none;
 }
 
+.group-row.dimmed {
+  opacity: 0.55;
+}
+
 .group-row span {
   display: block;
   color: #9ca3af;
@@ -839,6 +879,22 @@ export default {
 .fund-card-head h3 {
   margin: 0 0 4px;
   font-size: 16px;
+}
+
+.unavailable-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: #fef3c7;
+  color: #92400e;
+  font-size: 11px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+
+.fund-card.unavailable .fund-card-head {
+  background: #fffbeb;
 }
 
 .fund-card-head p {

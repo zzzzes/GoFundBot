@@ -238,6 +238,10 @@ export const screeningAPI = {
 // ==================== 基金回测 API ====================
 export const backtestAPI = {
   // 定投回测
+  runStrategy(data) {
+    return api.post('/backtest/strategy', data)
+  },
+
   fixedInvestment(data) {
     return api.post('/backtest/fixed-investment', data)
   }
